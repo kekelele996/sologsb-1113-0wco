@@ -45,6 +45,16 @@ export default function OverviewPage() {
   const telescopeById = (id: string) => telescopes.find((item) => item.id === id);
   const instrumentById = (id: string) => instruments.find((item) => item.id === id);
 
+  /** 已被设备侧置为维护中 / 外出、但本夜仍挂着排程段的望远镜 */
+  const unavailableTelescopeIds = useMemo(
+    () => new Set(telescopes.filter((telescope) => telescope.status === '维护中' || telescope.status === '外出').map((telescope) => telescope.id)),
+    [telescopes],
+  );
+  const unavailableSessions = useMemo(
+    () => nightSessions.filter((session) => unavailableTelescopeIds.has(session.telescopeId)),
+    [nightSessions, unavailableTelescopeIds],
+  );
+
   const altitudes = useMemo(() => {
     const map = new Map<string, { altitude: number; below: boolean }>();
     targets.forEach((target) => {
@@ -69,12 +79,17 @@ export default function OverviewPage() {
           label: `${target?.name ?? '未知目标'} · ${telescopeById(session.telescopeId)?.code ?? '-'}`,
           color: target ? TARGET_COLOR[target.type] : '#607d8b',
           dimmed: session.status === '因云取消' || Boolean(altitude?.below),
+          equipmentUnavailable: unavailableTelescopeIds.has(session.telescopeId),
           tooltip: `${session.startTime}-${session.endTime} ${target?.name ?? ''}｜${telescopeById(session.telescopeId)?.code ?? '-'} / ${
             instrumentById(session.instrumentId)?.model ?? '-'
-          }｜${session.filterSlot}｜${session.plannedFrames} 帧｜${session.status}｜评估高度角 ${altitude?.altitude ?? '-'}°`,
+          }｜${session.filterSlot}｜${session.plannedFrames} 帧｜${session.status}｜评估高度角 ${altitude?.altitude ?? '-'}°${
+            unavailableTelescopeIds.has(session.telescopeId)
+              ? `｜望远镜已${telescopeById(session.telescopeId)?.status ?? '不可用'}，需退回重排`
+              : ''
+          }`,
         };
       }),
-    [nightSessions, targets, altitudes, telescopes, instruments],
+    [nightSessions, targets, altitudes, telescopes, instruments, unavailableTelescopeIds],
   );
 
   const totalFrames = nightSessions.reduce((sum, session) => sum + session.plannedFrames, 0);
@@ -157,6 +172,16 @@ export default function OverviewPage() {
             </Typography>
           </CardContent>
         </Card>
+        <Card variant="outlined">
+          <CardContent>
+            <Typography variant="caption" color="text.secondary">
+              设备不可用待重排
+            </Typography>
+            <Typography variant="h5" color={unavailableSessions.length ? 'warning.main' : 'success.main'}>
+              {unavailableSessions.length}
+            </Typography>
+          </CardContent>
+        </Card>
       </Box>
 
       {conflicts.length > 0 ? (
@@ -167,6 +192,22 @@ export default function OverviewPage() {
               排程段 {conflict.sessionId} 与 {conflict.otherId} 在同一望远镜（{telescopeById(conflict.telescopeId)?.code ?? conflict.telescopeId}）上{conflict.overlapText}
             </div>
           ))}
+        </Alert>
+      ) : null}
+
+      {unavailableSessions.length > 0 ? (
+        <Alert severity="warning" sx={{ mb: 2 }}>
+          <AlertTitle>设备侧状态已变更，下列排程段需退回重排</AlertTitle>
+          {unavailableSessions.map((session) => {
+            const telescope = telescopeById(session.telescopeId);
+            const target = targetById(session.targetId);
+            return (
+              <div key={session.id}>
+                排程段 {session.id}（{target?.name ?? '未知目标'} · {session.startTime}-{session.endTime}）所用望远镜{' '}
+                {telescope?.code ?? session.telescopeId} 已被标记为「{telescope?.status ?? '不可用'}」，排期侧若仍按旧状态保存会被退回。
+              </div>
+            );
+          })}
         </Alert>
       ) : null}
 
@@ -261,6 +302,13 @@ export default function OverviewPage() {
                       <Chip size="small" variant="outlined" label={`${session.plannedFrames} 帧 × ${target?.exposureSec ?? '-'}s`} />
                       <StatusChip status={session.status} />
                       {ids.has(session.id) ? <Chip size="small" color="error" label="时段冲突" /> : null}
+                      {unavailableTelescopeIds.has(session.telescopeId) ? (
+                        <Chip
+                          size="small"
+                          color="warning"
+                          label={`${telescopeById(session.telescopeId)?.code ?? '望远镜'}已${telescopeById(session.telescopeId)?.status ?? '不可用'}，退回重排`}
+                        />
+                      ) : null}
                       {altitude?.below ? <Chip size="small" color="warning" label={`高度角 ${altitude.altitude}° 低于阈值 ${target?.minAltitude}°`} /> : <Chip size="small" color="success" variant="outlined" label={`高度角 ${altitude?.altitude ?? '-'}°`} />}
                       {session.rescheduleReason ? <Typography variant="caption" color="text.secondary">{session.rescheduleReason}</Typography> : null}
                     </Stack>

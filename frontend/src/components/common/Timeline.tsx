@@ -14,6 +14,8 @@ export interface TimelineBar {
   color: string;
   tooltip?: string;
   dimmed?: boolean;
+  /** 排程所用望远镜已被设备侧置为维护中 / 外出：叠加斜纹提示需退回重排 */
+  equipmentUnavailable?: boolean;
 }
 
 export interface TimelineProps {
@@ -103,8 +105,8 @@ export default function Timeline({
                     py: 0.5,
                     cursor: onBarClick ? 'pointer' : 'default',
                     opacity: bar.dimmed ? 0.42 : 1,
-                    border: conflict ? '2px solid' : '1px solid rgba(255,255,255,.35)',
-                    borderColor: conflict ? 'error.dark' : undefined,
+                    border: conflict ? '2px solid' : bar.equipmentUnavailable ? '2px dashed #f57c00' : '1px solid rgba(255,255,255,.35)',
+                    borderColor: conflict ? 'error.dark' : bar.equipmentUnavailable ? 'warning.main' : undefined,
                     overflow: 'hidden',
                     boxShadow: 1,
                   }}
@@ -115,6 +117,17 @@ export default function Timeline({
                   <Typography variant="caption" sx={{ display: 'block', whiteSpace: 'nowrap', opacity: 0.9 }}>
                     {minutesToTime(bar.startMinute)}-{minutesToTime(bar.endMinute)}
                   </Typography>
+                  {bar.equipmentUnavailable ? (
+                    <Box
+                      sx={{
+                        position: 'absolute',
+                        inset: 0,
+                        pointerEvents: 'none',
+                        background:
+                          'repeating-linear-gradient(135deg, rgba(0,0,0,0) 0 6px, rgba(245,124,0,.6) 6px 10px)',
+                      }}
+                    />
+                  ) : null}
                 </Box>
               </Tooltip>
             );

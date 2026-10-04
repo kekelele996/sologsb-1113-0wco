@@ -1,7 +1,8 @@
 import { create } from 'zustand';
-import { db, deleteRow, persistRow } from '../hooks/usePersistentStore';
+import { db, deleteRow, notifyTablesChanged } from '../hooks/usePersistentStore';
 import { uid } from '../utils/id';
-import type { FieldOfView, Instrument, Telescope, TelescopeStatus, TerminalType } from '../types';
+import { commitRow, mergeByFields, revisionOf } from '../utils/revision';
+import type { CommitConflict, FieldOfView, Instrument, Telescope, TelescopeStatus, TerminalType } from '../types';
 
 export interface TelescopeInput {
   code: string;
@@ -23,6 +24,14 @@ export interface InstrumentInput {
   telescopeCode: string;
 }
 
+export type SaveTelescopeResult =
+  | { type: 'saved'; telescope: Telescope; unchanged: boolean }
+  | { type: 'conflict'; outcome: CommitConflict<Telescope> };
+
+export type SaveInstrumentResult =
+  | { type: 'saved'; instrument: Instrument; unchanged: boolean }
+  | { type: 'conflict'; outcome: CommitConflict<Instrument> };
+
 interface EquipmentState {
   telescopes: Telescope[];
   instruments: Instrument[];
@@ -30,9 +39,25 @@ interface EquipmentState {
   hydrate: () => Promise<void>;
   addTelescope: (input: TelescopeInput) => Promise<Telescope>;
   updateTelescope: (id: string, patch: Partial<TelescopeInput>) => Promise<void>;
+  /** 乐观锁保存整条望远镜（expectedRevision 缺省为新增） */
+  saveTelescope: (telescope: Telescope, expectedRevision?: number) => Promise<SaveTelescopeResult>;
+  /** 冲突裁决后按字段合并落库 */
+  resolveTelescope: (
+    current: Telescope,
+    attempted: Telescope,
+    sideByField: Record<string, 'mine' | 'theirs'>,
+  ) => Promise<SaveTelescopeResult>;
   removeTelescope: (id: string) => Promise<void>;
   addInstrument: (input: InstrumentInput) => Promise<Instrument>;
   updateInstrument: (id: string, patch: Partial<InstrumentInput>) => Promise<void>;
+  /** 乐观锁保存整条终端适配 */
+  saveInstrument: (instrument: Instrument, expectedRevision?: number) => Promise<SaveInstrumentResult>;
+  /** 冲突裁决后按字段合并落库 */
+  resolveInstrument: (
+    current: Instrument,
+    attempted: Instrument,
+    sideByField: Record<string, 'mine' | 'theirs'>,
+  ) => Promise<SaveInstrumentResult>;
   removeInstrument: (id: string) => Promise<void>;
   /** 按靶面与焦距换算视场角 */
   fieldOfView: (telescopeId: string, instrumentId: string) => FieldOfView;
@@ -61,18 +86,55 @@ export const useEquipmentStore = create<EquipmentState>()((set, get) => ({
       terminals: input.terminals.length ? input.terminals : ['CMOS 相机'],
       maxPayloadKg: Number(input.maxPayloadKg) || 0,
       status: input.status,
+      revision: revisionOf(undefined),
     };
-    await persistRow('telescopes', telescope);
-    set({ telescopes: [...get().telescopes, telescope].sort((a, b) => a.code.localeCompare(b.code)) });
-    return telescope;
+    const outcome = await commitRow('telescopes', telescope);
+    notifyTablesChanged(['telescopes']);
+    const saved = outcome.type === 'saved' ? outcome.row : telescope;
+    set({ telescopes: [...get().telescopes, saved].sort((a, b) => a.code.localeCompare(b.code)) });
+    return saved;
   },
 
   updateTelescope: async (id, patch) => {
     const current = get().telescopes.find((telescope) => telescope.id === id);
     if (!current) return;
-    const next: Telescope = { ...current, ...patch };
-    await persistRow('telescopes', next);
-    set({ telescopes: get().telescopes.map((telescope) => (telescope.id === id ? next : telescope)) });
+    const next: Telescope = { ...current, ...patch, revision: revisionOf(current) };
+    const outcome = await commitRow('telescopes', next, revisionOf(current));
+    notifyTablesChanged(['telescopes']);
+    if (outcome.type === 'saved') {
+      set({ telescopes: get().telescopes.map((telescope) => (telescope.id === id ? outcome.row : telescope)) });
+    }
+  },
+
+  saveTelescope: async (telescope, expectedRevision) => {
+    const outcome = await commitRow('telescopes', telescope, expectedRevision);
+    notifyTablesChanged(['telescopes']);
+    if (outcome.type === 'saved') {
+      set((state) => ({
+        telescopes: state.telescopes
+          .filter((item) => item.id !== outcome.row.id)
+          .concat(outcome.row)
+          .sort((a, b) => a.code.localeCompare(b.code)),
+      }));
+      return { type: 'saved', telescope: outcome.row, unchanged: outcome.unchanged };
+    }
+    return { type: 'conflict', outcome };
+  },
+
+  resolveTelescope: async (current, attempted, sideByField) => {
+    const merged = mergeByFields(current, attempted, sideByField);
+    const outcome = await commitRow('telescopes', merged, revisionOf(current));
+    notifyTablesChanged(['telescopes']);
+    if (outcome.type === 'saved') {
+      set((state) => ({
+        telescopes: state.telescopes
+          .filter((item) => item.id !== outcome.row.id)
+          .concat(outcome.row)
+          .sort((a, b) => a.code.localeCompare(b.code)),
+      }));
+      return { type: 'saved', telescope: outcome.row, unchanged: outcome.unchanged };
+    }
+    return { type: 'conflict', outcome };
   },
 
   removeTelescope: async (id) => {
@@ -90,18 +152,49 @@ export const useEquipmentStore = create<EquipmentState>()((set, get) => ({
       sensorHeightMm: Number(input.sensorHeightMm) || 0,
       readNoiseE: Number(input.readNoiseE) || 0,
       telescopeCode: input.telescopeCode,
+      revision: revisionOf(undefined),
     };
-    await persistRow('instruments', instrument);
-    set({ instruments: [...get().instruments, instrument] });
-    return instrument;
+    const outcome = await commitRow('instruments', instrument);
+    notifyTablesChanged(['instruments']);
+    const saved = outcome.type === 'saved' ? outcome.row : instrument;
+    set({ instruments: [...get().instruments, saved] });
+    return saved;
   },
 
   updateInstrument: async (id, patch) => {
     const current = get().instruments.find((instrument) => instrument.id === id);
     if (!current) return;
-    const next: Instrument = { ...current, ...patch };
-    await persistRow('instruments', next);
-    set({ instruments: get().instruments.map((instrument) => (instrument.id === id ? next : instrument)) });
+    const next: Instrument = { ...current, ...patch, revision: revisionOf(current) };
+    const outcome = await commitRow('instruments', next, revisionOf(current));
+    notifyTablesChanged(['instruments']);
+    if (outcome.type === 'saved') {
+      set({ instruments: get().instruments.map((instrument) => (instrument.id === id ? outcome.row : instrument)) });
+    }
+  },
+
+  saveInstrument: async (instrument, expectedRevision) => {
+    const outcome = await commitRow('instruments', instrument, expectedRevision);
+    notifyTablesChanged(['instruments']);
+    if (outcome.type === 'saved') {
+      set((state) => ({
+        instruments: state.instruments.map((item) => (item.id === outcome.row.id ? outcome.row : item)),
+      }));
+      return { type: 'saved', instrument: outcome.row, unchanged: outcome.unchanged };
+    }
+    return { type: 'conflict', outcome };
+  },
+
+  resolveInstrument: async (current, attempted, sideByField) => {
+    const merged = mergeByFields(current, attempted, sideByField);
+    const outcome = await commitRow('instruments', merged, revisionOf(current));
+    notifyTablesChanged(['instruments']);
+    if (outcome.type === 'saved') {
+      set((state) => ({
+        instruments: state.instruments.map((item) => (item.id === outcome.row.id ? outcome.row : item)),
+      }));
+      return { type: 'saved', instrument: outcome.row, unchanged: outcome.unchanged };
+    }
+    return { type: 'conflict', outcome };
   },
 
   removeInstrument: async (id) => {

@@ -17,16 +17,30 @@ import Tooltip from '@mui/material/Tooltip';
 import Typography from '@mui/material/Typography';
 import { useNavigate } from 'react-router-dom';
 import ConflictBadge from '../components/common/ConflictBadge';
+import RevisionConflictDialog from '../components/common/RevisionConflictDialog';
 import { usePersistentStore } from '../hooks/usePersistentStore';
 import { useConflictCheck } from '../hooks/useConflictCheck';
 import { useSessionStore } from '../stores/sessionStore';
 import { useNightStore } from '../stores/nightStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
-import { NIGHT_TOTAL_MINUTES, TARGET_COLOR } from '../types';
+import {
+  NIGHT_TOTAL_MINUTES,
+  TARGET_COLOR,
+  TELESCOPE_STATUSES,
+  type Instrument,
+  type Telescope,
+  type TelescopeStatus,
+} from '../types';
+import { revisionOf } from '../utils/revision';
+import { INSTRUMENT_FIELD_LABELS, TELESCOPE_FIELD_LABELS, instrumentFieldFormatter, telescopeFieldFormatter } from '../utils/fieldLabels';
 import { axisMinutes, minutesToTime } from '../utils/astro';
 
 const SLOT_MINUTES = 30;
+
+type PendingConflict =
+  | { kind: 'telescope'; current: Telescope; attempted: Telescope }
+  | { kind: 'instrument'; current: Instrument; attempted: Instrument };
 
 /** 望远镜与终端分配视图：行 = 设备、列 = 30 分钟时段，冲突格标红并可一键跳转 */
 export default function EquipmentPage() {
@@ -35,6 +49,10 @@ export default function EquipmentPage() {
   const telescopes = useEquipmentStore((s) => s.telescopes);
   const instruments = useEquipmentStore((s) => s.instruments);
   const fieldOfView = useEquipmentStore((s) => s.fieldOfView);
+  const saveTelescope = useEquipmentStore((s) => s.saveTelescope);
+  const resolveTelescope = useEquipmentStore((s) => s.resolveTelescope);
+  const saveInstrument = useEquipmentStore((s) => s.saveInstrument);
+  const resolveInstrument = useEquipmentStore((s) => s.resolveInstrument);
   const sessions = useSessionStore((s) => s.sessions);
   const nights = useNightStore((s) => s.nights);
   const currentNightId = useNightStore((s) => s.currentNightId);
@@ -49,8 +67,104 @@ export default function EquipmentPage() {
   const conflicts = useMemo(() => conflictsOfNight(activeNightId), [conflictsOfNight, activeNightId]);
   const slots = useMemo(() => Array.from({ length: NIGHT_TOTAL_MINUTES / SLOT_MINUTES }, (_, index) => index), []);
 
+  // 行内编辑草稿：望远镜状态（id → 草稿），终端适配（id → 适配望远镜编号草稿）
+  const [telescopeDrafts, setTelescopeDrafts] = useState<Record<string, TelescopeStatus>>({});
+  const [instrumentDrafts, setInstrumentDrafts] = useState<Record<string, string>>({});
+  const [savingId, setSavingId] = useState('');
+  const [notice, setNotice] = useState('');
+  const [error, setError] = useState('');
+  const [pendingConflict, setPendingConflict] = useState<PendingConflict | null>(null);
+
+  /** 仍排程在维护中 / 外出望远镜上的本夜排程段（排期侧需退回重排） */
+  const unavailableSessions = useMemo(() => {
+    const unavailable = new Set(
+      telescopes.filter((telescope) => telescope.status === '维护中' || telescope.status === '外出').map((telescope) => telescope.id),
+    );
+    return nightSessions.filter((session) => unavailable.has(session.telescopeId));
+  }, [telescopes, nightSessions]);
+
   const targetById = (id: string) => targets.find((target) => target.id === id);
   const pairedInstrument = (telescopeCode: string) => instruments.find((instrument) => instrument.telescopeCode === telescopeCode);
+
+  async function saveTelescopeStatus(telescope: Telescope) {
+    const draft = telescopeDrafts[telescope.id];
+    if (!draft || draft === telescope.status) {
+      setTelescopeDrafts((prev) => {
+        const next = { ...prev };
+        delete next[telescope.id];
+        return next;
+      });
+      return;
+    }
+    setSavingId(telescope.id);
+    setError('');
+    try {
+      const attempted: Telescope = { ...telescope, status: draft, revision: revisionOf(telescope) };
+      const result = await saveTelescope(attempted, revisionOf(telescope));
+      if (result.type === 'conflict') {
+        setPendingConflict({ kind: 'telescope', current: result.outcome.current, attempted: result.outcome.attempted as Telescope });
+      } else {
+        setNotice(result.unchanged ? '望远镜状态未变化' : `望远镜 ${telescope.code} 已标记为「${draft}」`);
+        setTelescopeDrafts((prev) => {
+          const next = { ...prev };
+          delete next[telescope.id];
+          return next;
+        });
+      }
+    } finally {
+      setSavingId('');
+    }
+  }
+
+  async function saveInstrumentAdapter(instrument: Instrument) {
+    const draft = instrumentDrafts[instrument.id];
+    if (!draft || draft === instrument.telescopeCode) {
+      setInstrumentDrafts((prev) => {
+        const next = { ...prev };
+        delete next[instrument.id];
+        return next;
+      });
+      return;
+    }
+    setSavingId(instrument.id);
+    setError('');
+    try {
+      const attempted: Instrument = { ...instrument, telescopeCode: draft, revision: revisionOf(instrument) };
+      const result = await saveInstrument(attempted, revisionOf(instrument));
+      if (result.type === 'conflict') {
+        setPendingConflict({ kind: 'instrument', current: result.outcome.current, attempted: result.outcome.attempted as Instrument });
+      } else {
+        setNotice(result.unchanged ? '终端适配未变化' : `终端 ${instrument.model} 已改配到 ${draft}`);
+        setInstrumentDrafts((prev) => {
+          const next = { ...prev };
+          delete next[instrument.id];
+          return next;
+        });
+      }
+    } finally {
+      setSavingId('');
+    }
+  }
+
+  async function resolveConflict(sideByField: Record<string, 'mine' | 'theirs'>): Promise<boolean> {
+    if (!pendingConflict) return true;
+    if (pendingConflict.kind === 'telescope') {
+      const result = await resolveTelescope(pendingConflict.current, pendingConflict.attempted, sideByField);
+      if (result.type === 'conflict') {
+        setPendingConflict({ kind: 'telescope', current: result.outcome.current, attempted: result.outcome.attempted as Telescope });
+        return false;
+      }
+      setNotice(`望远镜 ${result.telescope.code} 已按裁决保存，两边改动均已保留`);
+    } else {
+      const result = await resolveInstrument(pendingConflict.current, pendingConflict.attempted, sideByField);
+      if (result.type === 'conflict') {
+        setPendingConflict({ kind: 'instrument', current: result.outcome.current, attempted: result.outcome.attempted as Instrument });
+        return false;
+      }
+      setNotice(`终端 ${result.instrument.model} 已按裁决保存，两边改动均已保留`);
+    }
+    return true;
+  }
 
   /** 某望远镜在某时段内的排程段 */
   const occupancy = (telescopeId: string, slot: number) => {
@@ -73,8 +187,19 @@ export default function EquipmentPage() {
         望远镜与终端分配视图
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-        以行 = 设备、列 = 30 分钟时段的占用网格呈现；同一望远镜在同一时段排入多段即标红，点击格子可一键跳转到对应排程段。
+        以行 = 设备、列 = 30 分钟时段的占用网格呈现；同一望远镜在同一时段排入多段即标红，点击格子可一键跳转到对应排程段。在此改动望远镜状态或终端适配时，与排程段列表的并发保存按字段裁决；被标为维护中 / 外出的望远镜上仍挂着的排程段会退回重排。
       </Typography>
+
+      {notice ? (
+        <Alert severity="success" sx={{ mb: 2 }} onClose={() => setNotice('')}>
+          {notice}
+        </Alert>
+      ) : null}
+      {error ? (
+        <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError('')}>
+          {error}
+        </Alert>
+      ) : null}
 
       <Stack direction="row" spacing={2} sx={{ mb: 2, flexWrap: 'wrap' }} alignItems="center">
         <TextField
@@ -109,11 +234,31 @@ export default function EquipmentPage() {
         </Alert>
       )}
 
+      {unavailableSessions.length > 0 ? (
+        <Alert
+          severity="warning"
+          sx={{ mb: 2 }}
+          action={
+            <Button color="inherit" size="small" onClick={() => navigate('/sessions')}>
+              去重排
+            </Button>
+          }
+        >
+          本夜有 {unavailableSessions.length} 段排程仍挂在已置为维护中 / 外出的望远镜上，保存这些段时会被退回，请通知排期侧重排：
+          {unavailableSessions
+            .map((session) => {
+              const telescope = telescopes.find((item) => item.id === session.telescopeId);
+              return `${session.id}（${telescope?.code ?? session.telescopeId} 已${telescope?.status ?? '不可用'}）`;
+            })
+            .join('；')}
+        </Alert>
+      ) : null}
+
       <TableContainer component={Paper} variant="outlined" sx={{ mb: 3 }}>
         <Table size="small" sx={{ minWidth: 1180 }}>
           <TableHead>
             <TableRow>
-              <TableCell sx={{ minWidth: 210 }}>望远镜 / 终端 / 视场角</TableCell>
+              <TableCell sx={{ minWidth: 250 }}>望远镜 / 终端 / 视场角 / 状态维护</TableCell>
               {slots.map((slot) => (
                 <TableCell key={slot} align="center" sx={{ px: 0.25 }}>
                   {minutesToTime(slot * SLOT_MINUTES)}
@@ -125,8 +270,10 @@ export default function EquipmentPage() {
             {telescopes.map((telescope) => {
               const instrument = pairedInstrument(telescope.code);
               const fov = instrument ? fieldOfView(telescope.id, instrument.id) : undefined;
+              const draft = telescopeDrafts[telescope.id];
+              const unavailable = telescope.status === '维护中' || telescope.status === '外出';
               return (
-                <TableRow key={telescope.id}>
+                <TableRow key={telescope.id} sx={unavailable ? { bgcolor: 'rgba(245,124,0,.06)' } : undefined}>
                   <TableCell>
                     <Stack spacing={0.25}>
                       <Stack direction="row" spacing={0.5} alignItems="center">
@@ -147,6 +294,35 @@ export default function EquipmentPage() {
                         {instrument ? `${instrument.model}（${instrument.terminalType}）` : '未配终端'}
                         {fov ? ` · 视场 ${fov.text}` : ''}
                       </Typography>
+                      <Stack direction="row" spacing={1} alignItems="center" sx={{ mt: 0.5 }}>
+                        <TextField
+                          select
+                          size="small"
+                          sx={{ width: 110 }}
+                          label="改为状态"
+                          value={draft ?? telescope.status}
+                          onChange={(event) =>
+                            setTelescopeDrafts((prev) => ({ ...prev, [telescope.id]: event.target.value as TelescopeStatus }))
+                          }
+                        >
+                          {TELESCOPE_STATUSES.map((status) => (
+                            <MenuItem key={status} value={status}>
+                              {status}
+                            </MenuItem>
+                          ))}
+                        </TextField>
+                        <Button
+                          size="small"
+                          variant="outlined"
+                          disabled={savingId === telescope.id || !draft || draft === telescope.status}
+                          onClick={() => void saveTelescopeStatus(telescope)}
+                        >
+                          {savingId === telescope.id ? '保存中…' : '保存状态'}
+                        </Button>
+                        <Typography variant="caption" color="text.secondary">
+                          序号 {revisionOf(telescope)}
+                        </Typography>
+                      </Stack>
                     </Stack>
                   </TableCell>
                   {slots.map((slot) => {
@@ -160,11 +336,16 @@ export default function EquipmentPage() {
                         sx={{
                           px: 0.25,
                           py: 0.5,
-                          bgcolor: isConflict ? 'error.main' : items.length === 1 ? TARGET_COLOR[target?.type ?? '星云'] : 'transparent',
+                          bgcolor: isConflict
+                            ? 'error.main'
+                            : items.length === 1
+                              ? TARGET_COLOR[target?.type ?? '星云']
+                              : 'transparent',
                           color: items.length ? '#fff' : 'text.secondary',
                           cursor: items.length ? 'pointer' : 'default',
                           borderLeft: '1px solid',
                           borderColor: 'divider',
+                          position: 'relative',
                         }}
                         onClick={() => {
                           if (items.length === 0) return;
@@ -180,12 +361,27 @@ export default function EquipmentPage() {
                             </Typography>
                           </Tooltip>
                         ) : (
-                          <Tooltip title={`${items[0].startTime}-${items[0].endTime} ${target?.name ?? ''} · ${items[0].status}`}>
+                          <Tooltip
+                            title={`${items[0].startTime}-${items[0].endTime} ${target?.name ?? ''} · ${items[0].status}${
+                              unavailable ? `｜望远镜${telescope.status}，该段需退回重排` : ''
+                            }`}
+                          >
                             <Typography variant="caption" sx={{ whiteSpace: 'nowrap' }}>
                               {target?.name ?? '已排'}
                             </Typography>
                           </Tooltip>
                         )}
+                        {unavailable && items.length > 0 && !isConflict ? (
+                          <Box
+                            sx={{
+                              position: 'absolute',
+                              inset: 0,
+                              pointerEvents: 'none',
+                              background:
+                                'repeating-linear-gradient(135deg, rgba(0,0,0,.0) 0 5px, rgba(245,124,0,.55) 5px 9px)',
+                            }}
+                          />
+                        ) : null}
                       </TableCell>
                     );
                   })}
@@ -208,14 +404,16 @@ export default function EquipmentPage() {
               <TableCell align="right">像元(μm)</TableCell>
               <TableCell>靶面(mm)</TableCell>
               <TableCell align="right">读出噪声(e-)</TableCell>
-              <TableCell>适配望远镜</TableCell>
+              <TableCell sx={{ minWidth: 230 }}>适配望远镜（可改配）</TableCell>
               <TableCell>视场角</TableCell>
+              <TableCell align="right">操作</TableCell>
             </TableRow>
           </TableHead>
           <TableBody>
             {instruments.map((instrument) => {
               const telescope = telescopes.find((item) => item.code === instrument.telescopeCode);
               const fov = telescope ? fieldOfView(telescope.id, instrument.id) : undefined;
+              const draft = instrumentDrafts[instrument.id];
               return (
                 <TableRow key={instrument.id} hover>
                   <TableCell>{instrument.model}</TableCell>
@@ -225,8 +423,38 @@ export default function EquipmentPage() {
                     {instrument.sensorWidthMm} × {instrument.sensorHeightMm}
                   </TableCell>
                   <TableCell align="right">{instrument.readNoiseE}</TableCell>
-                  <TableCell>{telescope ? `${telescope.code}（${telescope.status}）` : '未适配'}</TableCell>
+                  <TableCell>
+                    <Stack direction="row" spacing={1} alignItems="center">
+                      <TextField
+                        select
+                        size="small"
+                        sx={{ width: 150 }}
+                        value={draft ?? instrument.telescopeCode}
+                        onChange={(event) =>
+                          setInstrumentDrafts((prev) => ({ ...prev, [instrument.id]: event.target.value }))
+                        }
+                      >
+                        {telescopes.map((item) => (
+                          <MenuItem key={item.id} value={item.code}>
+                            {`${item.code}（${item.status}）`}
+                          </MenuItem>
+                        ))}
+                      </TextField>
+                      <Typography variant="caption" color="text.secondary">
+                        序号 {revisionOf(instrument)}
+                      </Typography>
+                    </Stack>
+                  </TableCell>
                   <TableCell>{fov?.text ?? '-'}</TableCell>
+                  <TableCell align="right">
+                    <Button
+                      size="small"
+                      disabled={savingId === instrument.id || !draft || draft === instrument.telescopeCode}
+                      onClick={() => void saveInstrumentAdapter(instrument)}
+                    >
+                      {savingId === instrument.id ? '保存中…' : '保存适配'}
+                    </Button>
+                  </TableCell>
                 </TableRow>
               );
             })}
@@ -239,6 +467,31 @@ export default function EquipmentPage() {
           前往排程段列表处理冲突
         </Button>
       </Box>
+
+      {pendingConflict?.kind === 'telescope' ? (
+        <RevisionConflictDialog<Telescope>
+          open
+          current={pendingConflict.current}
+          attempted={pendingConflict.attempted}
+          labels={TELESCOPE_FIELD_LABELS}
+          formatValue={telescopeFieldFormatter()}
+          description={`望远镜 ${pendingConflict.current.code} 同时被两边改动（例如排程段列表也改了该段的设备指派）。请为下列字段选择最终内容。`}
+          onResolve={resolveConflict}
+          onClose={() => setPendingConflict(null)}
+        />
+      ) : null}
+      {pendingConflict?.kind === 'instrument' ? (
+        <RevisionConflictDialog<Instrument>
+          open
+          current={pendingConflict.current}
+          attempted={pendingConflict.attempted}
+          labels={INSTRUMENT_FIELD_LABELS}
+          formatValue={instrumentFieldFormatter(telescopes)}
+          description={`终端 ${pendingConflict.current.model} 的适配望远镜与另一页签的改动冲突，请为下列字段选择最终内容。`}
+          onResolve={resolveConflict}
+          onClose={() => setPendingConflict(null)}
+        />
+      ) : null}
     </Box>
   );
 }

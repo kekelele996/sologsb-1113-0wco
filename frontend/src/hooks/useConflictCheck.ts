@@ -1,6 +1,8 @@
 import { useCallback } from 'react';
 import { useSessionStore } from '../stores/sessionStore';
+import { SCHEMA_VERSION } from './usePersistentStore';
 import type { ConflictItem, ObsSession } from '../types';
+import { INITIAL_REVISION } from '../types';
 import { overlapMinutes } from '../utils/astro';
 
 export interface ConflictCheckInput {
@@ -57,7 +59,8 @@ export function useConflictCheck(): ConflictCheckApi {
         filterSlot: '',
         plannedFrames: 0,
         status: '待执行',
-        schemaVersion: 2,
+        schemaVersion: SCHEMA_VERSION,
+        revision: INITIAL_REVISION,
       };
       return sessions
         .filter((session) => session.id !== input.ignoreSessionId)

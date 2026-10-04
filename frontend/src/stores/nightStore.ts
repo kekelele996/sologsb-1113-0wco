@@ -1,6 +1,7 @@
 import { create } from 'zustand';
-import { db, deleteRow, persistRow } from '../hooks/usePersistentStore';
+import { db, deleteRow, notifyTablesChanged } from '../hooks/usePersistentStore';
 import { uid } from '../utils/id';
+import { commitRow, revisionOf } from '../utils/revision';
 import type { ObsNight } from '../types';
 
 export interface NightInput {
@@ -62,18 +63,24 @@ export const useNightStore = create<NightState>()((set, get) => ({
       backup: input.backup,
       dutyOfficer: input.dutyOfficer.trim(),
       remark: input.remark?.trim() || undefined,
+      revision: revisionOf(undefined),
     };
-    await persistRow('nights', night);
-    set({ nights: [...get().nights, night].sort((a, b) => a.date.localeCompare(b.date)) });
-    return night;
+    const outcome = await commitRow('nights', night);
+    notifyTablesChanged(['nights']);
+    const saved = outcome.type === 'saved' ? outcome.row : night;
+    set({ nights: [...get().nights, saved].sort((a, b) => a.date.localeCompare(b.date)) });
+    return saved;
   },
 
   updateNight: async (id, patch) => {
     const current = get().nights.find((night) => night.id === id);
     if (!current) return;
-    const next: ObsNight = { ...current, ...patch };
-    await persistRow('nights', next);
-    set({ nights: get().nights.map((night) => (night.id === id ? next : night)) });
+    const next: ObsNight = { ...current, ...patch, revision: revisionOf(current) };
+    const outcome = await commitRow('nights', next, revisionOf(current));
+    notifyTablesChanged(['nights']);
+    if (outcome.type === 'saved') {
+      set({ nights: get().nights.map((night) => (night.id === id ? outcome.row : night)) });
+    }
   },
 
   removeNight: async (id) => {

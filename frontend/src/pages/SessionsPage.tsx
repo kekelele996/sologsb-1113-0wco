@@ -23,13 +23,16 @@ import Typography from '@mui/material/Typography';
 import StatusChip from '../components/common/StatusChip';
 import ConflictBadge from '../components/common/ConflictBadge';
 import FieldRow from '../components/common/FieldRow';
-import { usePersistentStore } from '../hooks/usePersistentStore';
+import RevisionConflictDialog from '../components/common/RevisionConflictDialog';
+import { usePersistentStore, SCHEMA_VERSION } from '../hooks/usePersistentStore';
 import { useConflictCheck } from '../hooks/useConflictCheck';
-import { useSessionStore } from '../stores/sessionStore';
+import { useSessionStore, type SaveSessionResult } from '../stores/sessionStore';
 import { useNightStore } from '../stores/nightStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
-import { FILTER_NAMES, SESSION_STATUSES, type SessionStatus } from '../types';
+import { FILTER_NAMES, SESSION_STATUSES, type ObsSession, type SessionStatus, type StaleTelescopeBlock } from '../types';
+import { revisionOf } from '../utils/revision';
+import { SESSION_FIELD_LABELS, sessionFieldFormatter } from '../utils/fieldLabels';
 import { axisMinutes, durationMinutes, formatMinutes } from '../utils/astro';
 
 interface SessionFormState {
@@ -45,12 +48,22 @@ interface SessionFormState {
   rescheduleReason: string;
 }
 
+/** 待裁决的并发冲突（单条编辑与批量改期共用一个队列，逐条弹出裁决） */
+interface ConflictEntry {
+  current: ObsSession;
+  attempted: ObsSession;
+  expectedRevision: number;
+  /** 裁决时的望远镜旧状态（本页签看到的），用于设备状态退回校验 */
+  seenTelescopeStatus?: string;
+}
+
 /** 排程段列表与冲突检测结果，支持批量改期到备用观测夜 */
 export default function SessionsPage() {
   usePersistentStore();
   const sessions = useSessionStore((s) => s.sessions);
-  const addSession = useSessionStore((s) => s.addSession);
-  const updateSession = useSessionStore((s) => s.updateSession);
+  const createSession = useSessionStore((s) => s.createSession);
+  const saveSession = useSessionStore((s) => s.saveSession);
+  const resolveSession = useSessionStore((s) => s.resolveSession);
   const removeSession = useSessionStore((s) => s.removeSession);
   const rescheduleToBackup = useSessionStore((s) => s.rescheduleToBackup);
   const nights = useNightStore((s) => s.nights);
@@ -69,11 +82,19 @@ export default function SessionsPage() {
   const [selected, setSelected] = useState<string[]>([]);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingId, setEditingId] = useState('');
+  /** 打开编辑对话框时该记录的改动序号（乐观锁基线） */
+  const [baseRevision, setBaseRevision] = useState<number | undefined>(undefined);
+  /** 打开编辑对话框时所选望远镜的状态（设备侧若在期间改为维护中/外出则退回） */
+  const [seenTelescopeStatus, setSeenTelescopeStatus] = useState<string | undefined>(undefined);
   const [error, setError] = useState('');
+  const [block, setBlock] = useState<StaleTelescopeBlock | null>(null);
   const [notice, setNotice] = useState('');
+  const [saving, setSaving] = useState(false);
   const [rescheduleOpen, setRescheduleOpen] = useState(false);
   const [rescheduleNight, setRescheduleNight] = useState('');
   const [rescheduleReason, setRescheduleReason] = useState('');
+  /** 并发冲突裁决队列（批量改期可能攒下多条，逐条弹） */
+  const [conflictQueue, setConflictQueue] = useState<ConflictEntry[]>([]);
   const [form, setForm] = useState<SessionFormState>({
     nightId: '',
     targetId: '',
@@ -86,6 +107,8 @@ export default function SessionsPage() {
     status: '待执行',
     rescheduleReason: '',
   });
+
+  const activeConflict = conflictQueue[0] ?? null;
 
   const conflictSet = useMemo(() => conflictIds(), [conflictIds]);
   const backupNights = useMemo(() => nights.filter((night) => night.backup), [nights]);
@@ -106,6 +129,11 @@ export default function SessionsPage() {
   const instrumentById = (id: string) => instruments.find((item) => item.id === id);
   const nightById = (id: string) => nights.find((night) => night.id === id);
 
+  const formatField = useMemo(
+    () => sessionFieldFormatter({ nights, targets, telescopes, instruments }),
+    [nights, targets, telescopes, instruments],
+  );
+
   const liveConflicts = useMemo(() => {
     if (!dialogOpen) return [];
     return findConflicts({
@@ -117,8 +145,13 @@ export default function SessionsPage() {
     });
   }, [dialogOpen, findConflicts, form.nightId, form.telescopeId, form.startTime, form.endTime, editingId]);
 
+  /** 当前选中望远镜的实时状态（表单切换望远镜时同步旧状态基线） */
+  const selectedTelescopeStatus = telescopeById(form.telescopeId)?.status;
+
   function openCreate() {
     setEditingId('');
+    setBaseRevision(undefined);
+    setBlock(null);
     setError('');
     const night = nights.find((item) => item.primary) ?? nights[0];
     const telescope = telescopes.find((item) => item.status === '可用') ?? telescopes[0];
@@ -135,6 +168,7 @@ export default function SessionsPage() {
       status: '待执行',
       rescheduleReason: '',
     });
+    setSeenTelescopeStatus(telescope?.status);
     setDialogOpen(true);
   }
 
@@ -142,6 +176,8 @@ export default function SessionsPage() {
     const session = sessions.find((item) => item.id === id);
     if (!session) return;
     setEditingId(id);
+    setBaseRevision(revisionOf(session));
+    setBlock(null);
     setError('');
     setForm({
       nightId: session.nightId,
@@ -155,7 +191,50 @@ export default function SessionsPage() {
       status: session.status,
       rescheduleReason: session.rescheduleReason ?? '',
     });
+    setSeenTelescopeStatus(telescopeById(session.telescopeId)?.status);
     setDialogOpen(true);
+  }
+
+  function buildAttemptedSession(): ObsSession {
+    const existing = editingId ? sessions.find((session) => session.id === editingId) : undefined;
+    if (existing) {
+      return normalizeAttempted(existing);
+    }
+    return createSession({ ...form, rescheduleReason: form.rescheduleReason.trim() || undefined });
+
+    function normalizeAttempted(existing: ObsSession): ObsSession {
+      return {
+        ...existing,
+        nightId: form.nightId,
+        targetId: form.targetId,
+        startTime: form.startTime,
+        endTime: form.endTime,
+        telescopeId: form.telescopeId,
+        instrumentId: form.instrumentId,
+        filterSlot: form.filterSlot,
+        plannedFrames: Number(form.plannedFrames) || 0,
+        status: form.status,
+        rescheduleReason: form.rescheduleReason.trim() || undefined,
+        schemaVersion: SCHEMA_VERSION,
+        revision: baseRevision ?? revisionOf(existing),
+      };
+    }
+  }
+
+  /** 保存返回「望远镜已不可用」退回时，写清是哪台设备发生了什么变化 */
+  function describeBlock(next: StaleTelescopeBlock): string {
+    return `排程被退回：望远镜 ${next.telescopeCode}（${next.telescopeId}）已被设备侧改为「${next.currentStatus}」（你打开本段时它还是「${next.seenStatus}」），该状态不可排程，请改换可用望远镜或改期后重排。`;
+  }
+
+  function enqueueConflict(outcome: Extract<SaveSessionResult, { type: 'conflict' }>['outcome'], attempted: ObsSession, seen?: string) {
+    if (outcome.type !== 'conflict') return;
+    const entry: ConflictEntry = {
+      current: outcome.current,
+      attempted,
+      expectedRevision: revisionOf(outcome.current),
+      seenTelescopeStatus: seen,
+    };
+    setConflictQueue((queue) => [...queue, entry]);
   }
 
   async function submit() {
@@ -171,14 +250,63 @@ export default function SessionsPage() {
       setError('该望远镜在所选时段已有排程，请调整时段或改期到备用观测夜');
       return;
     }
-    if (editingId) {
-      await updateSession(editingId, { ...form, rescheduleReason: form.rescheduleReason });
-      setNotice('已更新排程段');
-    } else {
-      await addSession({ ...form, rescheduleReason: form.rescheduleReason });
-      setNotice('已新增排程段');
+    setSaving(true);
+    setError('');
+    setBlock(null);
+    try {
+      const attempted = buildAttemptedSession();
+      if (editingId) {
+        const result = await saveSession(attempted, baseRevision, seenTelescopeStatus);
+        if (result.type === 'saved') {
+          setNotice(result.unchanged ? '记录内容未变化，已保留最新版本' : '已更新排程段');
+          setDialogOpen(false);
+        } else if (result.type === 'telescope-blocked') {
+          setBlock(result.block);
+          setError(describeBlock(result.block));
+        } else {
+          // 同一记录两边都动过：不覆盖，摊开差异让人定夺（编辑对话框保留在下层，不丢草稿）
+          enqueueConflict(result.outcome, attempted, seenTelescopeStatus);
+        }
+      } else {
+        const attempted = buildAttemptedSession();
+        const checked = await saveSession(attempted, undefined, seenTelescopeStatus);
+        if (checked.type === 'saved') {
+          setNotice('已新增排程段');
+          setDialogOpen(false);
+        } else if (checked.type === 'telescope-blocked') {
+          setBlock(checked.block);
+          setError(describeBlock(checked.block));
+        } else {
+          enqueueConflict(checked.outcome, checked.outcome.attempted, seenTelescopeStatus);
+        }
+      }
+    } finally {
+      setSaving(false);
     }
-    setDialogOpen(false);
+  }
+
+  /** 冲突对话框确认：按所选字段合并；落库期间又被改动则以新 current 继续留在队列里 */
+  async function resolveActiveConflict(sideByField: Record<string, 'mine' | 'theirs'>): Promise<boolean> {
+    if (!activeConflict) return true;
+    const result = await resolveSession(
+      activeConflict.current,
+      activeConflict.attempted,
+      sideByField,
+      activeConflict.seenTelescopeStatus,
+    );
+    if (result.type === 'telescope-blocked') {
+      setBlock(result.block);
+      setError(describeBlock(result.block));
+      setConflictQueue((queue) => queue.slice(1));
+      return true;
+    }
+    if (result.type === 'conflict') {
+      setConflictQueue((queue) => [{ ...activeConflict, current: result.outcome.current as ObsSession }, ...queue.slice(1)]);
+      return false;
+    }
+    setConflictQueue((queue) => queue.slice(1));
+    setNotice('已按裁决合并保存，两边改动均已保留');
+    return true;
   }
 
   async function submitReschedule() {
@@ -186,11 +314,48 @@ export default function SessionsPage() {
       setError('请选择备用观测夜');
       return;
     }
-    const count = await rescheduleToBackup(selected, rescheduleNight, rescheduleReason);
-    setNotice(`已将 ${count} 个排程段改期至 ${nightById(rescheduleNight)?.date ?? rescheduleNight}，原因：${rescheduleReason || '未填写'}`);
-    setSelected([]);
-    setRescheduleOpen(false);
-    setRescheduleReason('');
+    setSaving(true);
+    setError('');
+    setBlock(null);
+    try {
+      // 以当前列表里各望远镜的状态作为本页签基线
+      const telescopeStatusById = new Map(telescopes.map((telescope) => [telescope.id, telescope.status]));
+      const results = await rescheduleToBackup(selected, rescheduleNight, rescheduleReason, telescopeStatusById);
+      const blocked = results.filter((result): result is Extract<SaveSessionResult, { type: 'telescope-blocked' }> => result.type === 'telescope-blocked');
+      const conflicts = results.filter((result): result is Extract<SaveSessionResult, { type: 'conflict' }> => result.type === 'conflict');
+      const savedCount = results.filter((result) => result.type === 'saved').length;
+
+      if (blocked.length > 0) setBlock(blocked[0].block);
+
+      conflicts.forEach((result) => {
+        const attempted = {
+          ...(result.outcome.attempted as ObsSession),
+        };
+        enqueueConflict(
+          result.outcome,
+          attempted,
+          telescopeStatusById.get(attempted.telescopeId),
+        );
+      });
+
+      if (conflicts.length === 0 && blocked.length === 0) {
+        setNotice(`已将 ${savedCount} 个排程段改期至 ${nightById(rescheduleNight)?.date ?? rescheduleNight}，原因：${rescheduleReason || '未填写'}`);
+        setSelected([]);
+      } else {
+        const blockedText = blocked.length > 0 ? describeBlock(blocked[0].block) : '';
+        setNotice(
+          `改期结果：${savedCount} 段已保存，${conflicts.length} 段与另一页签的改动冲突待裁决，${blocked.length} 段因望远镜不可用被退回。${
+            blocked.length > 1 ? `（其余 ${blocked.length - 1} 条退回明细与本条同理）` : ''
+          }${blockedText ? `\n${blockedText}` : ''}`,
+        );
+        // 冲突段保留勾选，裁决完成后可直接对退回段重试
+        if (conflicts.length === 0) setSelected([]);
+      }
+      setRescheduleOpen(false);
+      setRescheduleReason('');
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
@@ -199,12 +364,18 @@ export default function SessionsPage() {
         排程段列表与冲突检测
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
-        同一时段同一望远镜重复排入即进入冲突列表；支持勾选多个排程段批量改期到备用观测夜并填写改期原因。
+        同一时段同一望远镜重复排入即进入冲突列表；支持勾选多个排程段批量改期到备用观测夜并填写改期原因。与设备分配视图同时保存时，没碰上的记录照常存下，同一条两边都动过会逐字段摊开裁决。
       </Typography>
 
       {notice ? (
-        <Alert severity="success" sx={{ mb: 2 }} onClose={() => setNotice('')}>
+        <Alert severity={block ? 'warning' : 'success'} sx={{ mb: 2, whiteSpace: 'pre-line' }} onClose={() => setNotice('')}>
           {notice}
+        </Alert>
+      ) : null}
+
+      {block ? (
+        <Alert severity="error" sx={{ mb: 2 }} onClose={() => setBlock(null)}>
+          {describeBlock(block)}
         </Alert>
       ) : null}
 
@@ -273,12 +444,14 @@ export default function SessionsPage() {
                 endTime: session.endTime,
                 ignoreSessionId: session.id,
               });
+              const telescope = telescopeById(session.telescopeId);
+              const telescopeUnavailable = telescope ? telescope.status === '维护中' || telescope.status === '外出' : false;
               return (
                 <TableRow
                   key={session.id}
                   hover
                   selected={selected.includes(session.id)}
-                  sx={session.id === highlightId ? { boxShadow: 'inset 4px 0 0 #d32f2f' } : undefined}
+                  sx={session.id === highlightId ? { boxShadow: 'inset 4px 0 0 #d32f2f' } : telescopeUnavailable ? { bgcolor: 'rgba(245,124,0,.08)' } : undefined}
                 >
                   <TableCell padding="checkbox">
                     <Checkbox
@@ -298,7 +471,10 @@ export default function SessionsPage() {
                   </TableCell>
                   <TableCell>{targetById(session.targetId)?.name ?? '未知目标'}</TableCell>
                   <TableCell>
-                    {telescopeById(session.telescopeId)?.code ?? '-'} / {instrumentById(session.instrumentId)?.model ?? '-'}
+                    {telescope?.code ?? '-'} / {instrumentById(session.instrumentId)?.model ?? '-'}
+                    {telescopeUnavailable ? (
+                      <Chip size="small" color="warning" variant="outlined" label={`望远镜${telescope?.status}，需重排`} sx={{ ml: 0.5 }} />
+                    ) : null}
                   </TableCell>
                   <TableCell>{session.filterSlot}</TableCell>
                   <TableCell align="right">{session.plannedFrames}</TableCell>
@@ -335,12 +511,17 @@ export default function SessionsPage() {
         </Table>
       </TableContainer>
 
-      <Dialog open={dialogOpen} onClose={() => setDialogOpen(false)} maxWidth="sm" fullWidth>
+      <Dialog open={dialogOpen} onClose={() => (saving ? undefined : setDialogOpen(false))} maxWidth="sm" fullWidth>
         <DialogTitle>{editingId ? '编辑排程段' : '新增排程段'}</DialogTitle>
         <DialogContent>
           {error ? (
             <Alert severity="error" sx={{ mb: 1.5 }}>
               {error}
+            </Alert>
+          ) : null}
+          {selectedTelescopeStatus === '维护中' || selectedTelescopeStatus === '外出' ? (
+            <Alert severity="warning" sx={{ mb: 1.5 }}>
+              所选望远镜当前为「{selectedTelescopeStatus}」，保存会被退回，请改换可用望远镜或改期。
             </Alert>
           ) : null}
           {liveConflicts.length > 0 ? (
@@ -387,6 +568,7 @@ export default function SessionsPage() {
                 const telescope = telescopes.find((item) => item.id === event.target.value);
                 const instrument = instruments.find((item) => item.telescopeCode === telescope?.code);
                 setForm({ ...form, telescopeId: event.target.value, instrumentId: instrument?.id ?? '' });
+                setSeenTelescopeStatus(telescope?.status);
               }}
             >
               {telescopes.map((telescope) => (
@@ -433,14 +615,16 @@ export default function SessionsPage() {
           </FieldRow>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setDialogOpen(false)}>取消</Button>
-          <Button variant="contained" onClick={() => void submit()}>
-            保存
+          <Button onClick={() => setDialogOpen(false)} disabled={saving}>
+            取消
+          </Button>
+          <Button variant="contained" onClick={() => void submit()} disabled={saving}>
+            {saving ? '保存中…' : '保存'}
           </Button>
         </DialogActions>
       </Dialog>
 
-      <Dialog open={rescheduleOpen} onClose={() => setRescheduleOpen(false)} maxWidth="sm" fullWidth>
+      <Dialog open={rescheduleOpen} onClose={() => (saving ? undefined : setRescheduleOpen(false))} maxWidth="sm" fullWidth>
         <DialogTitle>批量改期到备用观测夜</DialogTitle>
         <DialogContent>
           <Alert severity="info" sx={{ mb: 1.5 }}>
@@ -460,12 +644,25 @@ export default function SessionsPage() {
           </FieldRow>
         </DialogContent>
         <DialogActions>
-          <Button onClick={() => setRescheduleOpen(false)}>取消</Button>
-          <Button variant="contained" color="warning" onClick={() => void submitReschedule()}>
-            确认改期
+          <Button onClick={() => setRescheduleOpen(false)} disabled={saving}>
+            取消
+          </Button>
+          <Button variant="contained" color="warning" onClick={() => void submitReschedule()} disabled={saving}>
+            {saving ? '处理中…' : '确认改期'}
           </Button>
         </DialogActions>
       </Dialog>
+
+      <RevisionConflictDialog<ObsSession>
+        open={activeConflict !== null}
+        current={activeConflict?.current ?? null}
+        attempted={activeConflict?.attempted ?? null}
+        labels={SESSION_FIELD_LABELS}
+        formatValue={formatField}
+        description={`排程段 ${activeConflict?.current.id ?? ''} 同时被设备分配视图与排程段列表改动。未改动的字段自动保留，请为下列字段选择最终内容。`}
+        onResolve={resolveActiveConflict}
+        onClose={() => setConflictQueue((queue) => queue.slice(1))}
+      />
     </Box>
   );
 }

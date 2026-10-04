@@ -28,6 +28,8 @@ export interface ObsSession {
   backupNightId?: string;
   /** 数据结构版本 */
   schemaVersion: number;
+  /** 改动序号（乐观锁，跨页签并发保存用） */
+  revision: number;
 }
 
 /** 冲突项 */

@@ -19,10 +19,13 @@ import TableRow from '@mui/material/TableRow';
 import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
 import FieldRow from '../components/common/FieldRow';
+import RevisionConflictDialog from '../components/common/RevisionConflictDialog';
 import { usePersistentStore } from '../hooks/usePersistentStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useNightStore } from '../stores/nightStore';
 import { FILTER_NAMES, PRIORITIES, TARGET_COLOR, TARGET_TYPES, type FilterName, type ObsTarget, type Priority, type TargetType } from '../types';
+import { revisionOf } from '../utils/revision';
+import { TARGET_FIELD_LABELS, targetFieldFormatter } from '../utils/fieldLabels';
 import { altitudeAt, formatMinutes, isBelowThreshold, moonConflict, visibilityWindow } from '../utils/astro';
 
 interface TargetFormState {
@@ -59,8 +62,9 @@ const EMPTY_FORM: TargetFormState = {
 export default function TargetsPage() {
   usePersistentStore();
   const targets = useTargetStore((s) => s.targets);
-  const addTarget = useTargetStore((s) => s.addTarget);
-  const updateTarget = useTargetStore((s) => s.updateTarget);
+  const saveTarget = useTargetStore((s) => s.saveTarget);
+  const buildTargetDraft = useTargetStore((s) => s.buildTargetDraft);
+  const resolveTarget = useTargetStore((s) => s.resolveTarget);
   const removeTarget = useTargetStore((s) => s.removeTarget);
   const nights = useNightStore((s) => s.nights);
   const currentNightId = useNightStore((s) => s.currentNightId);
@@ -70,6 +74,8 @@ export default function TargetsPage() {
   const [sortByMagnitude, setSortByMagnitude] = useState(true);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [editingId, setEditingId] = useState('');
+  const [baseRevision, setBaseRevision] = useState<number | undefined>(undefined);
+  const [conflict, setConflict] = useState<{ current: ObsTarget; attempted: ObsTarget } | null>(null);
   const [form, setForm] = useState<TargetFormState>(EMPTY_FORM);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -89,6 +95,8 @@ export default function TargetsPage() {
 
   function openCreate() {
     setEditingId('');
+    setBaseRevision(undefined);
+    setConflict(null);
     setForm(EMPTY_FORM);
     setError('');
     setDialogOpen(true);
@@ -96,6 +104,8 @@ export default function TargetsPage() {
 
   function openEdit(target: ObsTarget) {
     setEditingId(target.id);
+    setBaseRevision(revisionOf(target));
+    setConflict(null);
     setError('');
     setForm({
       name: target.name,
@@ -128,13 +138,43 @@ export default function TargetsPage() {
       return;
     }
     if (editingId) {
-      await updateTarget(editingId, form);
-      setNotice(`已更新目标 ${form.name}`);
+      const existing = targets.find((target) => target.id === editingId);
+      if (!existing) return;
+      const attempted: ObsTarget = {
+        ...existing,
+        ...form,
+        remark: form.remark.trim() || undefined,
+        revision: baseRevision ?? revisionOf(existing),
+      };
+      const result = await saveTarget(attempted, baseRevision);
+      if (result.type === 'saved') {
+        setNotice(result.unchanged ? '记录内容未变化，已保留最新版本' : `已更新目标 ${form.name}`);
+        setDialogOpen(false);
+      } else {
+        setConflict({ current: result.outcome.current, attempted: result.outcome.attempted as ObsTarget });
+      }
     } else {
-      await addTarget(form);
-      setNotice(`已新增目标 ${form.name}`);
+      const attempted = buildTargetDraft({ ...form, remark: form.remark.trim() || undefined });
+      const result = await saveTarget(attempted, undefined);
+      if (result.type === 'saved') {
+        setNotice(`已新增目标 ${form.name}`);
+        setDialogOpen(false);
+      } else {
+        setConflict({ current: result.outcome.current, attempted: result.outcome.attempted as ObsTarget });
+      }
     }
+  }
+
+  async function resolveConflictSave(sideByField: Record<string, 'mine' | 'theirs'>): Promise<boolean> {
+    if (!conflict) return true;
+    const result = await resolveTarget(conflict.current, conflict.attempted, sideByField);
+    if (result.type === 'conflict') {
+      setConflict({ current: result.outcome.current, attempted: result.outcome.attempted as ObsTarget });
+      return false;
+    }
+    setNotice('已按裁决合并保存，两边改动均已保留');
     setDialogOpen(false);
+    return true;
   }
 
   return (
@@ -319,6 +359,17 @@ export default function TargetsPage() {
           </Button>
         </DialogActions>
       </Dialog>
+
+      <RevisionConflictDialog<ObsTarget>
+        open={conflict !== null}
+        current={conflict?.current ?? null}
+        attempted={conflict?.attempted ?? null}
+        labels={TARGET_FIELD_LABELS}
+        formatValue={targetFieldFormatter()}
+        description={`目标 ${conflict?.current.name ?? ''} 同时被两个页签改动，请为下列字段选择最终内容。`}
+        onResolve={resolveConflictSave}
+        onClose={() => setConflict(null)}
+      />
     </Box>
   );
 }
