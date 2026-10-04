@@ -69,9 +69,10 @@ export default function OverviewPage() {
           label: `${target?.name ?? '未知目标'} · ${telescopeById(session.telescopeId)?.code ?? '-'}`,
           color: target ? TARGET_COLOR[target.type] : '#607d8b',
           dimmed: session.status === '因云取消' || Boolean(altitude?.below),
+          warning: Boolean(session.needsReschedule),
           tooltip: `${session.startTime}-${session.endTime} ${target?.name ?? ''}｜${telescopeById(session.telescopeId)?.code ?? '-'} / ${
             instrumentById(session.instrumentId)?.model ?? '-'
-          }｜${session.filterSlot}｜${session.plannedFrames} 帧｜${session.status}｜评估高度角 ${altitude?.altitude ?? '-'}°`,
+          }｜${session.filterSlot}｜${session.plannedFrames} 帧｜${session.status}${session.needsReschedule ? '｜设备不可用，退回重排' : ''}｜评估高度角 ${altitude?.altitude ?? '-'}°`,
         };
       }),
     [nightSessions, targets, altitudes, telescopes, instruments],
@@ -90,6 +91,7 @@ export default function OverviewPage() {
         .filter((item): item is { target: NonNullable<ReturnType<typeof targetById>>; text: string } => Boolean(item && item.text)),
     [nightSessions, targets, night?.moonPhasePct],
   );
+  const rescheduleSessions = useMemo(() => nightSessions.filter((session) => session.needsReschedule), [nightSessions]);
 
   if (!night) {
     return <Alert severity="info">暂无观测夜数据</Alert>;
@@ -165,6 +167,18 @@ export default function OverviewPage() {
           {conflicts.map((conflict) => (
             <div key={`${conflict.sessionId}-${conflict.otherId}`}>
               排程段 {conflict.sessionId} 与 {conflict.otherId} 在同一望远镜（{telescopeById(conflict.telescopeId)?.code ?? conflict.telescopeId}）上{conflict.overlapText}
+            </div>
+          ))}
+        </Alert>
+      ) : null}
+
+      {rescheduleSessions.length > 0 ? (
+        <Alert severity="warning" sx={{ mb: 2 }}>
+          <AlertTitle>{rescheduleSessions.length} 段排程需退回重排（设备已被置为维护中/外出）</AlertTitle>
+          {rescheduleSessions.map((session) => (
+            <div key={session.id}>
+              排程段 {session.id}（{session.startTime}-{session.endTime}
+              ，{telescopeById(session.telescopeId)?.code ?? session.telescopeId}）：{session.rescheduleReason ?? '设备不可用，请调整时段或望远镜'}
             </div>
           ))}
         </Alert>
@@ -260,6 +274,7 @@ export default function OverviewPage() {
                       <Chip size="small" variant="outlined" label={`滤镜 ${session.filterSlot}`} />
                       <Chip size="small" variant="outlined" label={`${session.plannedFrames} 帧 × ${target?.exposureSec ?? '-'}s`} />
                       <StatusChip status={session.status} />
+                      {session.needsReschedule ? <Chip size="small" color="warning" label="退回重排" /> : null}
                       {ids.has(session.id) ? <Chip size="small" color="error" label="时段冲突" /> : null}
                       {altitude?.below ? <Chip size="small" color="warning" label={`高度角 ${altitude.altitude}° 低于阈值 ${target?.minAltitude}°`} /> : <Chip size="small" color="success" variant="outlined" label={`高度角 ${altitude?.altitude ?? '-'}°`} />}
                       {session.rescheduleReason ? <Typography variant="caption" color="text.secondary">{session.rescheduleReason}</Typography> : null}

@@ -21,6 +21,8 @@ export interface Telescope {
   maxPayloadKg: number;
   /** 当前状态 */
   status: TelescopeStatus;
+  /** 改动序号：每次写入 +1，用于两个页签并发编辑时检测冲突 */
+  rev: number;
 }
 
 /** 终端（相机 / 导星相机 / 光谱仪） */
@@ -40,6 +42,8 @@ export interface Instrument {
   readNoiseE: number;
   /** 适配望远镜编号 */
   telescopeCode: string;
+  /** 改动序号：每次写入 +1，用于两个页签并发编辑时检测冲突 */
+  rev: number;
 }
 
 /** 视场角计算结果 */

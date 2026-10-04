@@ -38,7 +38,7 @@ export const useTargetStore = create<TargetState>()((set, get) => ({
   },
 
   addTarget: async (input) => {
-    const target: ObsTarget = {
+    const target: Omit<ObsTarget, 'rev'> = {
       id: uid('target'),
       name: input.name.trim(),
       catalog: input.catalog.trim(),
@@ -53,17 +53,17 @@ export const useTargetStore = create<TargetState>()((set, get) => ({
       minAltitude: Number(input.minAltitude) || 0,
       remark: input.remark?.trim() || undefined,
     };
-    await persistRow('targets', target);
-    set({ targets: [...get().targets, target].sort((a, b) => a.name.localeCompare(b.name)) });
-    return target;
+    const saved = await persistRow<ObsTarget>('targets', target);
+    set({ targets: [...get().targets, saved].sort((a, b) => a.name.localeCompare(b.name)) });
+    return saved;
   },
 
   updateTarget: async (id, patch) => {
     const current = get().targets.find((target) => target.id === id);
     if (!current) return;
     const next: ObsTarget = { ...current, ...patch };
-    await persistRow('targets', next);
-    set({ targets: get().targets.map((target) => (target.id === id ? next : target)) });
+    const saved = await persistRow<ObsTarget>('targets', next);
+    set({ targets: get().targets.map((target) => (target.id === id ? saved : target)) });
   },
 
   removeTarget: async (id) => {

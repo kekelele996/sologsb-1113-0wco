@@ -17,13 +17,15 @@ import Tooltip from '@mui/material/Tooltip';
 import Typography from '@mui/material/Typography';
 import { useNavigate } from 'react-router-dom';
 import ConflictBadge from '../components/common/ConflictBadge';
+import ConflictDialog from '../components/common/ConflictDialog';
 import { usePersistentStore } from '../hooks/usePersistentStore';
 import { useConflictCheck } from '../hooks/useConflictCheck';
 import { useSessionStore } from '../stores/sessionStore';
 import { useNightStore } from '../stores/nightStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
-import { NIGHT_TOTAL_MINUTES, TARGET_COLOR } from '../types';
+import { NIGHT_TOTAL_MINUTES, TELESCOPE_STATUSES, TARGET_COLOR, type Instrument, type Telescope, type TelescopeStatus } from '../types';
+import type { RecordConflict } from '../utils/merge';
 import { axisMinutes, minutesToTime } from '../utils/astro';
 
 const SLOT_MINUTES = 30;
@@ -40,9 +42,16 @@ export default function EquipmentPage() {
   const currentNightId = useNightStore((s) => s.currentNightId);
   const setCurrentNight = useNightStore((s) => s.setCurrentNight);
   const targets = useTargetStore((s) => s.targets);
+  const updateTelescope = useEquipmentStore((s) => s.updateTelescope);
+  const updateInstrument = useEquipmentStore((s) => s.updateInstrument);
+  const resolveTelescopeConflict = useEquipmentStore((s) => s.resolveTelescopeConflict);
+  const resolveInstrumentConflict = useEquipmentStore((s) => s.resolveInstrumentConflict);
   const { conflictsOfNight } = useConflictCheck();
 
   const [nightId, setNightId] = useState(currentNightId);
+  /** 并发编辑冲突：同一条设备记录被另一个页签改动过，摊开差异让人定用哪边 */
+  const [conflict, setConflict] = useState<RecordConflict | null>(null);
+  const [notice, setNotice] = useState('');
   const activeNightId = nightId || currentNightId;
   const night = nights.find((item) => item.id === activeNightId);
   const nightSessions = useMemo(() => sessions.filter((session) => session.nightId === activeNightId), [sessions, activeNightId]);
@@ -67,6 +76,43 @@ export default function EquipmentPage() {
       .sort((a, b) => axisMinutes(a.startTime) - axisMinutes(b.startTime));
   };
 
+  /** 设备管理员切换望远镜状态（可用 / 维护中 / 外出） */
+  async function handleStatusChange(telescopeId: string, status: TelescopeStatus) {
+    const outcome = await updateTelescope(telescopeId, { status });
+    if (outcome.status === 'conflict') {
+      setConflict(outcome.conflict);
+      return;
+    }
+    setNotice(`望远镜 ${outcome.row.code} 状态已置为「${outcome.row.status}」`);
+  }
+
+  /** 设备管理员调整终端适配望远镜 */
+  async function handleInstrumentChange(instrumentId: string, telescopeCode: string) {
+    const outcome = await updateInstrument(instrumentId, { telescopeCode });
+    if (outcome.status === 'conflict') {
+      setConflict(outcome.conflict);
+      return;
+    }
+    setNotice(`终端 ${outcome.row.model} 已适配到 ${outcome.row.telescopeCode}`);
+  }
+
+  /** 冲突裁决：写入用户选定的合并结果；null 表示接受对方删除 */
+  async function handleResolve(row: Record<string, unknown> | null) {
+    if (!conflict) return;
+    if (row === null) {
+      setConflict(null);
+      setNotice(`已按对方页签的删除处理该${conflict.recordLabel}`);
+      return;
+    }
+    if (conflict.table === 'telescopes') {
+      await resolveTelescopeConflict(row as unknown as Telescope);
+    } else {
+      await resolveInstrumentConflict(row as unknown as Instrument);
+    }
+    setConflict(null);
+    setNotice('已按所选内容合并保存');
+  }
+
   return (
     <Box>
       <Typography variant="h5" sx={{ mb: 0.5 }}>
@@ -75,6 +121,12 @@ export default function EquipmentPage() {
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2 }}>
         以行 = 设备、列 = 30 分钟时段的占用网格呈现；同一望远镜在同一时段排入多段即标红，点击格子可一键跳转到对应排程段。
       </Typography>
+
+      {notice ? (
+        <Alert severity="success" sx={{ mb: 2 }} onClose={() => setNotice('')}>
+          {notice}
+        </Alert>
+      ) : null}
 
       <Stack direction="row" spacing={2} sx={{ mb: 2, flexWrap: 'wrap' }} alignItems="center">
         <TextField
@@ -133,12 +185,19 @@ export default function EquipmentPage() {
                         <Typography variant="body2" sx={{ fontWeight: 600 }}>
                           {telescope.code}
                         </Typography>
-                        <Chip
+                        <TextField
+                          select
                           size="small"
-                          label={telescope.status}
-                          color={telescope.status === '可用' ? 'success' : telescope.status === '维护中' ? 'warning' : 'default'}
-                          variant="outlined"
-                        />
+                          value={telescope.status}
+                          onChange={(event) => void handleStatusChange(telescope.id, event.target.value as TelescopeStatus)}
+                          sx={{ minWidth: 96, '& .MuiSelect-select': { py: 0.25, fontSize: 12 } }}
+                        >
+                          {TELESCOPE_STATUSES.map((status) => (
+                            <MenuItem key={status} value={status}>
+                              {status}
+                            </MenuItem>
+                          ))}
+                        </TextField>
                       </Stack>
                       <Typography variant="caption" color="text.secondary">
                         {telescope.apertureMm}mm · f/{telescope.focalLengthMm}mm · {telescope.mount} · 载荷 {telescope.maxPayloadKg}kg
@@ -225,7 +284,21 @@ export default function EquipmentPage() {
                     {instrument.sensorWidthMm} × {instrument.sensorHeightMm}
                   </TableCell>
                   <TableCell align="right">{instrument.readNoiseE}</TableCell>
-                  <TableCell>{telescope ? `${telescope.code}（${telescope.status}）` : '未适配'}</TableCell>
+                  <TableCell>
+                    <TextField
+                      select
+                      size="small"
+                      value={instrument.telescopeCode}
+                      onChange={(event) => void handleInstrumentChange(instrument.id, event.target.value)}
+                      sx={{ minWidth: 120, '& .MuiSelect-select': { py: 0.25, fontSize: 12 } }}
+                    >
+                      {telescopes.map((item) => (
+                        <MenuItem key={item.id} value={item.code}>
+                          {item.code}（{item.status}）
+                        </MenuItem>
+                      ))}
+                    </TextField>
+                  </TableCell>
                   <TableCell>{fov?.text ?? '-'}</TableCell>
                 </TableRow>
               );
@@ -239,6 +312,8 @@ export default function EquipmentPage() {
           前往排程段列表处理冲突
         </Button>
       </Box>
+
+      <ConflictDialog open={Boolean(conflict)} conflict={conflict} onClose={() => setConflict(null)} onResolve={(row) => void handleResolve(row)} />
     </Box>
   );
 }

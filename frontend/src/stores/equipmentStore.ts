@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { db, deleteRow, persistRow } from '../hooks/usePersistentStore';
+import { threeWayMerge, fieldLabel, isEqualValue, type RecordConflict } from '../utils/merge';
 import { uid } from '../utils/id';
 import type { FieldOfView, Instrument, Telescope, TelescopeStatus, TerminalType } from '../types';
 
@@ -23,22 +24,97 @@ export interface InstrumentInput {
   telescopeCode: string;
 }
 
+/** 设备记录保存结果：已保存 / 冲突待裁决 */
+export type EquipmentSaveOutcome<T> = { status: 'saved'; row: T } | { status: 'conflict'; conflict: RecordConflict };
+
 interface EquipmentState {
   telescopes: Telescope[];
   instruments: Instrument[];
   hydrated: boolean;
   hydrate: () => Promise<void>;
   addTelescope: (input: TelescopeInput) => Promise<Telescope>;
-  updateTelescope: (id: string, patch: Partial<TelescopeInput>) => Promise<void>;
+  updateTelescope: (id: string, patch: Partial<TelescopeInput>) => Promise<EquipmentSaveOutcome<Telescope>>;
   removeTelescope: (id: string) => Promise<void>;
   addInstrument: (input: InstrumentInput) => Promise<Instrument>;
-  updateInstrument: (id: string, patch: Partial<InstrumentInput>) => Promise<void>;
+  updateInstrument: (id: string, patch: Partial<InstrumentInput>) => Promise<EquipmentSaveOutcome<Instrument>>;
   removeInstrument: (id: string) => Promise<void>;
+  /** 冲突裁决后写入用户选定的望远镜记录 */
+  resolveTelescopeConflict: (row: Telescope) => Promise<void>;
+  /** 冲突裁决后写入用户选定的终端记录 */
+  resolveInstrumentConflict: (row: Instrument) => Promise<void>;
   /** 按靶面与焦距换算视场角 */
   fieldOfView: (telescopeId: string, instrumentId: string) => FieldOfView;
 }
 
 const RAD = Math.PI / 180;
+
+/** 参与三向合并的望远镜字段 */
+const TELESCOPE_FIELDS = ['code', 'apertureMm', 'focalLengthMm', 'mount', 'terminals', 'maxPayloadKg', 'status'] as const;
+/** 参与三向合并的终端字段 */
+const INSTRUMENT_FIELDS = ['model', 'terminalType', 'pixelSizeUm', 'sensorWidthMm', 'sensorHeightMm', 'readNoiseE', 'telescopeCode'] as const;
+
+/** 通用：更新一条设备记录（望远镜/终端），处理并发冲突 */
+async function updateEquipmentRecord<T extends { id: string; rev: number }>(
+  table: 'telescopes' | 'instruments',
+  id: string,
+  patch: Record<string, unknown>,
+  fields: readonly string[],
+  recordLabel: string,
+  rows: T[],
+  setRows: (rows: T[]) => void,
+): Promise<EquipmentSaveOutcome<T>> {
+  const base = rows.find((row) => row.id === id);
+  if (!base) return { status: 'saved', row: { id, ...patch } as T };
+  const theirs = await db.table(table).get(id);
+  const ours = { ...base, ...patch };
+
+  if (!theirs) {
+    const changedFields = fields.filter((field) => !isEqualValue(ours[field], (base as Record<string, unknown>)[field]));
+    return {
+      status: 'conflict',
+      conflict: {
+        table,
+        recordId: id,
+        recordLabel,
+        fields: changedFields.map((field) => ({
+          field,
+          label: fieldLabel(field),
+          base: (base as Record<string, unknown>)[field],
+          ours: ours[field],
+          theirs: undefined,
+        })),
+        ours: ours as Record<string, unknown>,
+        theirs: {},
+        theirsMissing: true,
+      },
+    };
+  }
+
+  if (theirs.rev === base.rev) {
+    const saved = await persistRow<T>(table, ours);
+    setRows(rows.map((row) => (row.id === id ? saved : row)));
+    return { status: 'saved', row: saved };
+  }
+
+  const { merged, conflicts } = threeWayMerge(base, ours, theirs, fields);
+  if (conflicts.length > 0) {
+    return {
+      status: 'conflict',
+      conflict: {
+        table,
+        recordId: id,
+        recordLabel,
+        fields: conflicts,
+        ours: ours as Record<string, unknown>,
+        theirs: theirs as Record<string, unknown>,
+      },
+    };
+  }
+
+  const saved = await persistRow<T>(table, merged);
+  setRows(rows.map((row) => (row.id === id ? saved : row)));
+  return { status: 'saved', row: saved };
+}
 
 /** 望远镜与终端分配（含视场角换算） */
 export const useEquipmentStore = create<EquipmentState>()((set, get) => ({
@@ -52,7 +128,7 @@ export const useEquipmentStore = create<EquipmentState>()((set, get) => ({
   },
 
   addTelescope: async (input) => {
-    const telescope: Telescope = {
+    const telescope: Omit<Telescope, 'rev'> = {
       id: uid('tel'),
       code: input.code.trim(),
       apertureMm: Number(input.apertureMm) || 0,
@@ -62,17 +138,22 @@ export const useEquipmentStore = create<EquipmentState>()((set, get) => ({
       maxPayloadKg: Number(input.maxPayloadKg) || 0,
       status: input.status,
     };
-    await persistRow('telescopes', telescope);
-    set({ telescopes: [...get().telescopes, telescope].sort((a, b) => a.code.localeCompare(b.code)) });
-    return telescope;
+    const saved = await persistRow<Telescope>('telescopes', telescope);
+    set({ telescopes: [...get().telescopes, saved].sort((a, b) => a.code.localeCompare(b.code)) });
+    return saved;
   },
 
   updateTelescope: async (id, patch) => {
-    const current = get().telescopes.find((telescope) => telescope.id === id);
-    if (!current) return;
-    const next: Telescope = { ...current, ...patch };
-    await persistRow('telescopes', next);
-    set({ telescopes: get().telescopes.map((telescope) => (telescope.id === id ? next : telescope)) });
+    const outcome = await updateEquipmentRecord<Telescope>(
+      'telescopes',
+      id,
+      patch as Record<string, unknown>,
+      TELESCOPE_FIELDS,
+      '望远镜',
+      get().telescopes,
+      (rows) => set({ telescopes: rows }),
+    );
+    return outcome;
   },
 
   removeTelescope: async (id) => {
@@ -81,7 +162,7 @@ export const useEquipmentStore = create<EquipmentState>()((set, get) => ({
   },
 
   addInstrument: async (input) => {
-    const instrument: Instrument = {
+    const instrument: Omit<Instrument, 'rev'> = {
       id: uid('ins'),
       model: input.model.trim(),
       terminalType: input.terminalType,
@@ -91,22 +172,37 @@ export const useEquipmentStore = create<EquipmentState>()((set, get) => ({
       readNoiseE: Number(input.readNoiseE) || 0,
       telescopeCode: input.telescopeCode,
     };
-    await persistRow('instruments', instrument);
-    set({ instruments: [...get().instruments, instrument] });
-    return instrument;
+    const saved = await persistRow<Instrument>('instruments', instrument);
+    set({ instruments: [...get().instruments, saved] });
+    return saved;
   },
 
   updateInstrument: async (id, patch) => {
-    const current = get().instruments.find((instrument) => instrument.id === id);
-    if (!current) return;
-    const next: Instrument = { ...current, ...patch };
-    await persistRow('instruments', next);
-    set({ instruments: get().instruments.map((instrument) => (instrument.id === id ? next : instrument)) });
+    const outcome = await updateEquipmentRecord<Instrument>(
+      'instruments',
+      id,
+      patch as Record<string, unknown>,
+      INSTRUMENT_FIELDS,
+      '终端',
+      get().instruments,
+      (rows) => set({ instruments: rows }),
+    );
+    return outcome;
   },
 
   removeInstrument: async (id) => {
     await deleteRow('instruments', id);
     set({ instruments: get().instruments.filter((instrument) => instrument.id !== id) });
+  },
+
+  resolveTelescopeConflict: async (row) => {
+    const saved = await persistRow<Telescope>('telescopes', row);
+    set({ telescopes: get().telescopes.map((telescope) => (telescope.id === saved.id ? saved : telescope)) });
+  },
+
+  resolveInstrumentConflict: async (row) => {
+    const saved = await persistRow<Instrument>('instruments', row);
+    set({ instruments: get().instruments.map((instrument) => (instrument.id === saved.id ? saved : instrument)) });
   },
 
   fieldOfView: (telescopeId, instrumentId) => {

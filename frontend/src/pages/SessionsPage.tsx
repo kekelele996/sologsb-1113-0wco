@@ -22,6 +22,7 @@ import TextField from '@mui/material/TextField';
 import Typography from '@mui/material/Typography';
 import StatusChip from '../components/common/StatusChip';
 import ConflictBadge from '../components/common/ConflictBadge';
+import ConflictDialog from '../components/common/ConflictDialog';
 import FieldRow from '../components/common/FieldRow';
 import { usePersistentStore } from '../hooks/usePersistentStore';
 import { useConflictCheck } from '../hooks/useConflictCheck';
@@ -29,7 +30,8 @@ import { useSessionStore } from '../stores/sessionStore';
 import { useNightStore } from '../stores/nightStore';
 import { useTargetStore } from '../stores/targetStore';
 import { useEquipmentStore } from '../stores/equipmentStore';
-import { FILTER_NAMES, SESSION_STATUSES, type SessionStatus } from '../types';
+import { FILTER_NAMES, SESSION_STATUSES, type ObsSession, type SessionStatus } from '../types';
+import type { RecordConflict } from '../utils/merge';
 import { axisMinutes, durationMinutes, formatMinutes } from '../utils/astro';
 
 interface SessionFormState {
@@ -53,6 +55,7 @@ export default function SessionsPage() {
   const updateSession = useSessionStore((s) => s.updateSession);
   const removeSession = useSessionStore((s) => s.removeSession);
   const rescheduleToBackup = useSessionStore((s) => s.rescheduleToBackup);
+  const resolveSessionConflict = useSessionStore((s) => s.resolveSessionConflict);
   const nights = useNightStore((s) => s.nights);
   const targets = useTargetStore((s) => s.targets);
   const telescopes = useEquipmentStore((s) => s.telescopes);
@@ -74,6 +77,8 @@ export default function SessionsPage() {
   const [rescheduleOpen, setRescheduleOpen] = useState(false);
   const [rescheduleNight, setRescheduleNight] = useState('');
   const [rescheduleReason, setRescheduleReason] = useState('');
+  /** 并发编辑冲突：同一条排程段被另一个页签改动过，摊开差异让人定用哪边 */
+  const [conflict, setConflict] = useState<RecordConflict | null>(null);
   const [form, setForm] = useState<SessionFormState>({
     nightId: '',
     targetId: '',
@@ -171,13 +176,40 @@ export default function SessionsPage() {
       setError('该望远镜在所选时段已有排程，请调整时段或改期到备用观测夜');
       return;
     }
-    if (editingId) {
-      await updateSession(editingId, { ...form, rescheduleReason: form.rescheduleReason });
-      setNotice('已更新排程段');
-    } else {
-      await addSession({ ...form, rescheduleReason: form.rescheduleReason });
-      setNotice('已新增排程段');
+    const outcome = editingId
+      ? await updateSession(editingId, { ...form, rescheduleReason: form.rescheduleReason })
+      : await addSession({ ...form, rescheduleReason: form.rescheduleReason });
+
+    if (outcome.status === 'conflict') {
+      // 同一条被另一个页签动过：摊开差异，让人定用哪边
+      setConflict(outcome.conflict);
+      return;
     }
+    if (outcome.status === 'reschedule') {
+      setNotice(
+        `设备 ${outcome.equipment.code} 已变为「${outcome.equipment.to}」，本排程段已退回重排（改期原因已注明设备变化）`,
+      );
+    } else {
+      setNotice(editingId ? '已更新排程段' : '已新增排程段');
+    }
+    setDialogOpen(false);
+  }
+
+  /** 冲突裁决：写入用户选定的合并结果；null 表示接受对方删除 */
+  async function handleResolve(row: Record<string, unknown> | null) {
+    if (!conflict) return;
+    if (row === null) {
+      await removeSession(conflict.recordId);
+      setNotice(`排程段 ${conflict.recordId} 已按对方页签的删除处理`);
+    } else {
+      const outcome = await resolveSessionConflict(row as unknown as ObsSession);
+      if (outcome.status === 'reschedule') {
+        setNotice(`设备 ${outcome.equipment.code} 已变为「${outcome.equipment.to}」，本排程段已退回重排`);
+      } else {
+        setNotice('已按所选内容合并保存');
+      }
+    }
+    setConflict(null);
     setDialogOpen(false);
   }
 
@@ -303,7 +335,10 @@ export default function SessionsPage() {
                   <TableCell>{session.filterSlot}</TableCell>
                   <TableCell align="right">{session.plannedFrames}</TableCell>
                   <TableCell>
-                    <StatusChip status={session.status} />
+                    <Stack direction="row" spacing={0.5} alignItems="center">
+                      <StatusChip status={session.status} />
+                      {session.needsReschedule ? <Chip size="small" color="warning" label="退回重排" /> : null}
+                    </Stack>
                   </TableCell>
                   <TableCell>
                     <ConflictBadge conflicts={conflicts} compact />
@@ -466,6 +501,8 @@ export default function SessionsPage() {
           </Button>
         </DialogActions>
       </Dialog>
+
+      <ConflictDialog open={Boolean(conflict)} conflict={conflict} onClose={() => setConflict(null)} onResolve={(row) => void handleResolve(row)} />
     </Box>
   );
 }

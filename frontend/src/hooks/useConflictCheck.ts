@@ -58,6 +58,7 @@ export function useConflictCheck(): ConflictCheckApi {
         plannedFrames: 0,
         status: '待执行',
         schemaVersion: 2,
+        rev: 0,
       };
       return sessions
         .filter((session) => session.id !== input.ignoreSessionId)

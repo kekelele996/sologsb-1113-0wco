@@ -46,7 +46,7 @@ export const useNightStore = create<NightState>()((set, get) => ({
   setCurrentNight: (id) => set({ currentNightId: id }),
 
   addNight: async (input) => {
-    const night: ObsNight = {
+    const night: Omit<ObsNight, 'rev'> = {
       id: uid('night'),
       date: input.date,
       siteName: input.siteName.trim(),
@@ -63,17 +63,17 @@ export const useNightStore = create<NightState>()((set, get) => ({
       dutyOfficer: input.dutyOfficer.trim(),
       remark: input.remark?.trim() || undefined,
     };
-    await persistRow('nights', night);
-    set({ nights: [...get().nights, night].sort((a, b) => a.date.localeCompare(b.date)) });
-    return night;
+    const saved = await persistRow<ObsNight>('nights', night);
+    set({ nights: [...get().nights, saved].sort((a, b) => a.date.localeCompare(b.date)) });
+    return saved;
   },
 
   updateNight: async (id, patch) => {
     const current = get().nights.find((night) => night.id === id);
     if (!current) return;
     const next: ObsNight = { ...current, ...patch };
-    await persistRow('nights', next);
-    set({ nights: get().nights.map((night) => (night.id === id ? next : night)) });
+    const saved = await persistRow<ObsNight>('nights', next);
+    set({ nights: get().nights.map((night) => (night.id === id ? saved : night)) });
   },
 
   removeNight: async (id) => {

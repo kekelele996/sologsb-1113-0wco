@@ -55,6 +55,33 @@ class ObsPlanDB extends Dexie {
             }
           });
       });
+
+    // v3：为旧数据补齐改动序号 rev（起始值 1），并初始化 revCounter 计数器。
+    // rev 用于两个页签并发编辑时的三向合并：没动过的记录 rev 不变，不算冲突。
+    this.version(3)
+      .stores({
+        targets: 'id, name, catalog, type, priority, magnitude',
+        sessions: 'id, nightId, targetId, telescopeId, instrumentId, startTime, status, backupNightId',
+        telescopes: 'id, code, status',
+        instruments: 'id, model, telescopeCode, terminalType',
+        nights: 'id, date, siteName, primary, backup',
+        meta: 'key',
+      })
+      .upgrade(async (tx) => {
+        const tables = ['targets', 'sessions', 'telescopes', 'instruments', 'nights'];
+        for (const table of tables) {
+          await tx
+            .table(table)
+            .toCollection()
+            .modify((row: { rev?: number }) => {
+              if (typeof row.rev !== 'number') {
+                row.rev = 1;
+              }
+            });
+        }
+        // 所有记录起始 rev 均为 1，计数器从 1 起
+        await tx.table('meta').put({ key: REV_COUNTER_KEY, value: '1' });
+      });
   }
 }
 
@@ -62,14 +89,53 @@ export const db = new ObsPlanDB();
 
 export type TableName = 'targets' | 'sessions' | 'telescopes' | 'instruments' | 'nights';
 
-/** 写入单条记录（Dexie 读写封装，store 的增删改统一走这里） */
-export async function persistRow(table: TableName, row: unknown): Promise<void> {
-  await db.table(table).put(row as never);
+/** 改动序号计数器在 meta 表中的 key */
+export const REV_COUNTER_KEY = 'revCounter';
+
+/**
+ * 取下一个改动序号：通过 Dexie 读写事务原子自增，两个页签同时保存也不会拿到相同序号。
+ * 若历史数据缺少计数器（v3 迁移未覆盖的边界情况），则取各表现存最大 rev 作为兜底。
+ */
+export async function nextRev(): Promise<number> {
+  return await db.transaction('rw', db.meta, async () => {
+    const row = await db.meta.get(REV_COUNTER_KEY);
+    let current = Number(row?.value);
+    if (!Number.isFinite(current) || current < 0) {
+      // 计数器丢失时兜底：扫描全部记录取最大 rev
+      const tables: TableName[] = ['targets', 'sessions', 'telescopes', 'instruments', 'nights'];
+      let max = 0;
+      for (const table of tables) {
+        const rows = await db.table(table).toArray();
+        for (const item of rows as Array<{ rev?: number }>) {
+          if (typeof item.rev === 'number' && item.rev > max) max = item.rev;
+        }
+      }
+      current = max;
+    }
+    const next = current + 1;
+    await db.meta.put({ key: REV_COUNTER_KEY, value: String(next) });
+    return next;
+  });
 }
 
-/** 批量写入 */
-export async function persistRows(table: TableName, rows: unknown[]): Promise<void> {
-  await db.table(table).bulkPut(rows as never[]);
+/**
+ * 写入单条记录并自动分配改动序号 rev（Dexie 读写封装，store 的增删改统一走这里）。
+ * 传入的 row 不含 rev，返回写入后的完整记录（含 rev）。
+ */
+export async function persistRow<T extends { id: string }>(table: TableName, row: Omit<T, 'rev'>): Promise<T> {
+  const rev = await nextRev();
+  const next = { ...row, rev } as unknown as T;
+  await db.table(table).put(next as never);
+  return next;
+}
+
+/** 批量写入（逐条分配 rev） */
+export async function persistRows<T extends { id: string }>(table: TableName, rows: Array<Omit<T, 'rev'>>): Promise<T[]> {
+  const saved: T[] = [];
+  for (const row of rows) {
+    saved.push(await persistRow<T>(table, row));
+  }
+  return saved;
 }
 
 /** 删除记录 */
@@ -79,7 +145,7 @@ export async function deleteRow(table: TableName, id: string): Promise<void> {
 
 /* ------------------------------- 示例数据 ------------------------------- */
 
-const SEED_TARGETS: ObsTarget[] = [
+const SEED_TARGETS: Array<Omit<ObsTarget, 'rev'>> = [
   { id: 'target-001', name: 'M31', catalog: 'NGC 224', raHours: 0.712, decDeg: 41.27, magnitude: 3.4, type: '星系', filter: 'L', exposureSec: 120, totalMinutes: 90, priority: 'P1', minAltitude: 25, remark: '仙女座大星系，需大视场' },
   { id: 'target-002', name: 'M42', catalog: 'NGC 1976', raHours: 5.588, decDeg: -5.39, magnitude: 4, type: '星云', filter: 'L', exposureSec: 60, totalMinutes: 60, priority: 'P1', minAltitude: 20, remark: '猎户座大星云，核心易过曝' },
   { id: 'target-003', name: 'M45', catalog: 'Mel 22', raHours: 3.79, decDeg: 24.11, magnitude: 1.6, type: '疏散星团', filter: '无滤镜', exposureSec: 30, totalMinutes: 30, priority: 'P2', minAltitude: 25 },
@@ -94,7 +160,7 @@ const SEED_TARGETS: ObsTarget[] = [
   { id: 'target-012', name: 'IC 1396', catalog: 'C33', raHours: 21.65, decDeg: 57.5, magnitude: 3.5, type: '星云', filter: 'SII', exposureSec: 300, totalMinutes: 180, priority: 'P3', minAltitude: 40, remark: '象鼻星云' },
 ];
 
-const SEED_NIGHTS: ObsNight[] = [
+const SEED_NIGHTS: Array<Omit<ObsNight, 'rev'>> = [
   { id: 'night-001', date: '2025-10-11', siteName: '兴隆观测站', siteLat: 40.3958, siteLng: 117.5772, moonPhasePct: 18, moonrise: '08:40', moonset: '19:05', sunset: '17:42', sunrise: '05:26', cloudText: '晴', primary: true, backup: false, dutyOfficer: '林一舟' },
   { id: 'night-002', date: '2025-10-12', siteName: '兴隆观测站', siteLat: 40.3958, siteLng: 117.5772, moonPhasePct: 26, moonrise: '09:35', moonset: '19:40', sunset: '17:41', sunrise: '05:27', cloudText: '少云', primary: true, backup: false, dutyOfficer: '林一舟' },
   { id: 'night-003', date: '2025-10-13', siteName: '兴隆观测站', siteLat: 40.3958, siteLng: 117.5772, moonPhasePct: 35, moonrise: '10:32', moonset: '20:18', sunset: '17:39', sunrise: '05:28', cloudText: '多云', primary: false, backup: true, dutyOfficer: '沈知远', remark: '备用观测夜' },
@@ -102,14 +168,14 @@ const SEED_NIGHTS: ObsNight[] = [
   { id: 'night-005', date: '2025-10-15', siteName: '兴隆观测站', siteLat: 40.3958, siteLng: 117.5772, moonPhasePct: 55, moonrise: '12:28', moonset: '21:46', sunset: '17:36', sunrise: '05:30', cloudText: '有雨', primary: false, backup: true, dutyOfficer: '苏晚', remark: '预报有雨，预留备用' },
 ];
 
-const SEED_TELESCOPES: Telescope[] = [
+const SEED_TELESCOPES: Array<Omit<Telescope, 'rev'>> = [
   { id: 'tel-001', code: 'T-01', apertureMm: 150, focalLengthMm: 900, mount: 'EQ6-R Pro', terminals: ['CMOS 相机', '导星相机'], maxPayloadKg: 12, status: '可用' },
   { id: 'tel-002', code: 'T-02', apertureMm: 200, focalLengthMm: 1000, mount: 'CEM70', terminals: ['CMOS 相机', '导星相机', '光谱仪'], maxPayloadKg: 15, status: '可用' },
   { id: 'tel-003', code: 'T-03', apertureMm: 280, focalLengthMm: 2800, mount: 'CEM120', terminals: ['CMOS 相机', '光谱仪'], maxPayloadKg: 25, status: '维护中', },
   { id: 'tel-004', code: 'T-04', apertureMm: 80, focalLengthMm: 480, mount: 'Star Adventurer GTi', terminals: ['导星相机'], maxPayloadKg: 5, status: '外出' },
 ];
 
-const SEED_INSTRUMENTS: Instrument[] = [
+const SEED_INSTRUMENTS: Array<Omit<Instrument, 'rev'>> = [
   { id: 'ins-001', model: 'ASI2600MC Pro', terminalType: 'CMOS 相机', pixelSizeUm: 3.76, sensorWidthMm: 23.5, sensorHeightMm: 15.7, readNoiseE: 1.2, telescopeCode: 'T-02' },
   { id: 'ins-002', model: 'ASI294MC Pro', terminalType: 'CMOS 相机', pixelSizeUm: 4.63, sensorWidthMm: 19.1, sensorHeightMm: 13, readNoiseE: 1.4, telescopeCode: 'T-01' },
   { id: 'ins-003', model: 'ASI174MM Mini', terminalType: '导星相机', pixelSizeUm: 5.86, sensorWidthMm: 11.3, sensorHeightMm: 7.1, readNoiseE: 3.5, telescopeCode: 'T-01' },
@@ -117,7 +183,7 @@ const SEED_INSTRUMENTS: Instrument[] = [
 ];
 
 /** 含一处同望远镜时段冲突（s-03 与 s-04 在 T-02 上重叠）与一条因云取消已改期记录 */
-const SEED_SESSIONS: ObsSession[] = [
+const SEED_SESSIONS: Array<Omit<ObsSession, 'rev'>> = [
   { id: 's-01', nightId: 'night-001', targetId: 'target-001', startTime: '18:20', endTime: '19:20', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'L', plannedFrames: 40, status: '已完成', schemaVersion: SCHEMA_VERSION },
   { id: 's-02', nightId: 'night-001', targetId: 'target-002', startTime: '19:30', endTime: '20:30', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'L', plannedFrames: 45, status: '已完成', schemaVersion: SCHEMA_VERSION },
   { id: 's-03', nightId: 'night-001', targetId: 'target-004', startTime: '20:40', endTime: '22:10', telescopeId: 'tel-002', instrumentId: 'ins-001', filterSlot: 'Ha', plannedFrames: 30, status: '待执行', schemaVersion: SCHEMA_VERSION },
@@ -134,6 +200,11 @@ const SEED_SESSIONS: ObsSession[] = [
   { id: 's-14', nightId: 'night-002', targetId: 'target-001', startTime: '02:10', endTime: '03:10', telescopeId: 'tel-001', instrumentId: 'ins-002', filterSlot: 'L', plannedFrames: 30, status: '待执行', schemaVersion: SCHEMA_VERSION },
 ];
 
+/** 给示例数据补上起始改动序号 rev=1（升级迁移时旧数据同样补 1） */
+function withRev<T extends { id: string }>(rows: Array<Omit<T, 'rev'>>): T[] {
+  return rows.map((row) => ({ ...row, rev: 1 }) as unknown as T);
+}
+
 /** 首次打开（表内无数据）时写入示例数据 */
 export async function seedIfEmpty(): Promise<void> {
   const flag = await db.meta.get('seeded');
@@ -147,12 +218,14 @@ export async function seedIfEmpty(): Promise<void> {
   ]);
   // Dexie 的 transaction 最多接受 5 张表 + 作用域，因此 meta 标记在事务外写入
   await db.transaction('rw', db.targets, db.sessions, db.telescopes, db.instruments, db.nights, async () => {
-    if (targetCount === 0) await db.targets.bulkPut(SEED_TARGETS);
-    if (nightCount === 0) await db.nights.bulkPut(SEED_NIGHTS);
-    if (telescopeCount === 0) await db.telescopes.bulkPut(SEED_TELESCOPES);
-    if (instrumentCount === 0) await db.instruments.bulkPut(SEED_INSTRUMENTS);
-    if (sessionCount === 0) await db.sessions.bulkPut(SEED_SESSIONS);
+    if (targetCount === 0) await db.targets.bulkPut(withRev<ObsTarget>(SEED_TARGETS));
+    if (nightCount === 0) await db.nights.bulkPut(withRev<ObsNight>(SEED_NIGHTS));
+    if (telescopeCount === 0) await db.telescopes.bulkPut(withRev<Telescope>(SEED_TELESCOPES));
+    if (instrumentCount === 0) await db.instruments.bulkPut(withRev<Instrument>(SEED_INSTRUMENTS));
+    if (sessionCount === 0) await db.sessions.bulkPut(withRev<ObsSession>(SEED_SESSIONS));
   });
+  // 示例数据起始 rev 均为 1，计数器从 1 起
+  await db.meta.put({ key: REV_COUNTER_KEY, value: '1' });
   await db.meta.put({ key: 'seeded', value: new Date().toISOString() });
 }
 

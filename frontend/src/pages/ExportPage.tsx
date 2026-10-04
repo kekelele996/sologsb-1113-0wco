@@ -61,7 +61,8 @@ export default function ExportPage() {
           label: target?.name ?? '未知目标',
           color: target ? TARGET_COLOR[target.type] : '#607d8b',
           dimmed: session.status === '因云取消',
-          tooltip: `${session.startTime}-${session.endTime} · ${session.filterSlot} · ${session.plannedFrames} 帧 · ${session.status}`,
+          warning: Boolean(session.needsReschedule),
+          tooltip: `${session.startTime}-${session.endTime} · ${session.filterSlot} · ${session.plannedFrames} 帧 · ${session.status}${session.needsReschedule ? ' · 退回重排' : ''}`,
         };
       }),
     [nightSessions, targets],

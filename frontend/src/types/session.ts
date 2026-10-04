@@ -28,6 +28,10 @@ export interface ObsSession {
   backupNightId?: string;
   /** 数据结构版本 */
   schemaVersion: number;
+  /** 改动序号：每次写入 +1，用于两个页签并发编辑时检测冲突 */
+  rev: number;
+  /** 设备不可用退回重排标记（望远镜被置为维护中/外出时置为 true） */
+  needsReschedule?: boolean;
 }
 
 /** 冲突项 */

@@ -29,6 +29,8 @@ export interface ObsNight {
   dutyOfficer: string;
   /** 备注 */
   remark?: string;
+  /** 改动序号：每次写入 +1，用于两个页签并发编辑时检测冲突 */
+  rev: number;
 }
 
 export const CLOUD_TEXTS: string[] = ['晴', '少云', '多云', '阴', '有雨'];

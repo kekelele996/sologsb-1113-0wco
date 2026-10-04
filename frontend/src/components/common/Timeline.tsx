@@ -14,6 +14,8 @@ export interface TimelineBar {
   color: string;
   tooltip?: string;
   dimmed?: boolean;
+  /** 退回重排：用橙色边框 + 角标提示 */
+  warning?: boolean;
 }
 
 export interface TimelineProps {
@@ -96,15 +98,15 @@ export default function Timeline({
                     width: `${widthPct}%`,
                     minWidth: 56,
                     height: height - 34,
-                    bgcolor: conflict ? 'error.main' : bar.color,
+                    bgcolor: conflict ? 'error.main' : bar.warning ? 'warning.main' : bar.color,
                     color: '#fff',
                     borderRadius: 1,
                     px: 0.75,
                     py: 0.5,
                     cursor: onBarClick ? 'pointer' : 'default',
                     opacity: bar.dimmed ? 0.42 : 1,
-                    border: conflict ? '2px solid' : '1px solid rgba(255,255,255,.35)',
-                    borderColor: conflict ? 'error.dark' : undefined,
+                    border: conflict ? '2px solid' : bar.warning ? '2px solid' : '1px solid rgba(255,255,255,.35)',
+                    borderColor: conflict ? 'error.dark' : bar.warning ? 'warning.dark' : undefined,
                     overflow: 'hidden',
                     boxShadow: 1,
                   }}

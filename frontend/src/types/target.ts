@@ -34,6 +34,8 @@ export interface ObsTarget {
   minAltitude: number;
   /** 备注 */
   remark?: string;
+  /** 改动序号：每次写入 +1，用于两个页签并发编辑时检测冲突 */
+  rev: number;
 }
 
 export const TARGET_TYPES: TargetType[] = ['星系', '星云', '疏散星团', '行星', '月面'];
